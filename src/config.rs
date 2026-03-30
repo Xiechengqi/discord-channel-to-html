@@ -10,24 +10,27 @@ const CONFIG_FILE_NAME: &str = "config.toml";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiscordConfig {
-    /// Full Discord channel URL, e.g. https://discord.com/channels/799672011265015819/1162768567821930597
-    pub channel_url: String,
+    /// Discord server URL, e.g. https://discord.com/channels/799672011265015819
+    pub server_url: String,
 }
 
 impl DiscordConfig {
-    /// Extract (guild_id, channel_id) from channel_url.
-    /// Returns empty strings if the URL doesn't match the expected format.
-    pub fn parse_ids(&self) -> (String, String) {
-        // Expected path: /channels/{guild_id}/{channel_id}
-        let path = self.channel_url
+    /// Extract guild_id from server_url.
+    pub fn guild_id(&self) -> String {
+        let path = self.server_url
             .trim_start_matches("https://discord.com")
             .trim_start_matches("http://discord.com");
         let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
-        if parts.len() >= 3 && parts[0] == "channels" {
-            (parts[1].to_string(), parts[2].to_string())
+        if parts.len() >= 2 && parts[0] == "channels" {
+            parts[1].to_string()
         } else {
-            (String::new(), String::new())
+            String::new()
         }
+    }
+
+    /// Build a channel URL from guild_id + channel_id.
+    pub fn channel_url(&self, channel_id: &str) -> String {
+        format!("{}/{}", self.server_url.trim_end_matches('/'), channel_id)
     }
 }
 
@@ -51,7 +54,8 @@ impl AuthConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ScraperConfig {
     pub poll_interval_secs: u64,
-    pub initial_scroll_pages: u64,
+    #[serde(default)]
+    pub max_history_pages: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -87,15 +91,15 @@ impl Default for AppConfig {
             .map(|h| {
                 h.join(".config")
                     .join(CONFIG_DIR_NAME)
-                    .join("messages.db")
+                    .join("data")
                     .to_string_lossy()
                     .to_string()
             })
-            .unwrap_or_else(|| "messages.db".to_string());
+            .unwrap_or_else(|| "data".to_string());
 
         Self {
             discord: DiscordConfig {
-                channel_url: String::new(),
+                server_url: String::new(),
             },
             server: ServerConfig {
                 host: "0.0.0.0".to_string(),
@@ -106,7 +110,7 @@ impl Default for AppConfig {
             },
             scraper: ScraperConfig {
                 poll_interval_secs: 5,
-                initial_scroll_pages: 100,
+                max_history_pages: None,
             },
             agent_browser: AgentBrowserConfig {
                 binary: "agent-browser".to_string(),

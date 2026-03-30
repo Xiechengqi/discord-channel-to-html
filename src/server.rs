@@ -1,11 +1,11 @@
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::time::Instant;
 
 use axum::Json;
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::Router;
 use serde::Deserialize;
 use serde_json::json;
@@ -13,35 +13,47 @@ use tokio::sync::Notify;
 
 use crate::auth::check_auth;
 use crate::config::AppConfig;
-use crate::db::MessageStore;
 use crate::errors::AppError;
+use crate::server_store::ServerStore;
 
 pub struct AppState {
-    pub store: Arc<MessageStore>,
+    pub server_store: Arc<ServerStore>,
     pub config: AppConfig,
     pub start_time: Instant,
-    pub resync_notify: Arc<Notify>,
-    pub monitor_status: Arc<RwLock<String>>,
+    pub monitor_notify: Arc<Notify>,
 }
 
 pub async fn serve(
     config: AppConfig,
-    store: Arc<MessageStore>,
-    resync_notify: Arc<Notify>,
-    monitor_status: Arc<RwLock<String>>,
+    server_store: Arc<ServerStore>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let monitor_notify = Arc::new(Notify::new());
+
     let state = Arc::new(AppState {
-        store,
+        server_store: server_store.clone(),
         config: config.clone(),
         start_time: Instant::now(),
-        resync_notify,
-        monitor_status,
+        monitor_notify: monitor_notify.clone(),
+    });
+
+    // Spawn the monitor manager
+    let monitor_config = config.clone();
+    let monitor_store = server_store.clone();
+    let monitor_notify_ref = monitor_notify.clone();
+    tokio::spawn(async move {
+        crate::monitor::run_monitor_loop(monitor_config, monitor_store, monitor_notify_ref).await;
     });
 
     let app = Router::new()
+        .route("/api/channels", get(get_channels))
+        .route("/api/channels/refresh", post(refresh_channels))
+        .route("/api/channels/{channel_id}/monitor", post(add_monitor))
+        .route("/api/channels/{channel_id}/monitor", delete(remove_monitor))
+        .route("/api/channels/{channel_id}/resync", post(resync_channel))
         .route("/api/messages", get(get_messages))
         .route("/api/messages/latest", get(get_latest))
-        .route("/api/resync", post(resync))
+        .route("/api/config", get(get_config))
+        .route("/api/config", post(update_config))
         .route("/health", get(health))
         .fallback(crate::embedded::serve_static)
         .with_state(state);
@@ -54,22 +66,48 @@ pub async fn serve(
 }
 
 async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let count = state.store.count().unwrap_or(0);
     let uptime = state.start_time.elapsed().as_secs();
-    let status = state.monitor_status.read()
-        .map(|s| s.clone())
-        .unwrap_or_else(|_| "unknown".to_string());
+    let channels = state.server_store.get_all_channels().unwrap_or_default();
+    let monitored: Vec<_> = channels.iter().filter(|c| c.monitored).collect();
+    let total_messages: u64 = monitored.iter()
+        .map(|c| state.server_store.channel_message_count(&c.channel_id))
+        .sum();
 
     Json(json!({
         "ok": true,
-        "message_count": count,
+        "server_url": state.config.discord.server_url,
         "uptime_secs": uptime,
-        "channel": state.config.discord.channel_url,
-        "monitor_status": status,
+        "total_channels": channels.len(),
+        "monitored_channels": monitored.len(),
+        "total_messages": total_messages,
     }))
 }
 
-async fn resync(
+/// Return all channels (from server.db).
+async fn get_channels(
+    State(state): State<Arc<AppState>>,
+) -> Result<impl IntoResponse, AppError> {
+    let channels = state.server_store.get_all_channels()?;
+    let enriched: Vec<_> = channels.iter().map(|c| {
+        let count = state.server_store.channel_message_count(&c.channel_id);
+        json!({
+            "channel_id": c.channel_id,
+            "name": c.name,
+            "type": c.channel_type,
+            "channel_url": c.channel_url,
+            "monitored": c.monitored,
+            "message_count": count,
+        })
+    }).collect();
+
+    Ok(Json(json!({
+        "ok": true,
+        "channels": enriched,
+    })))
+}
+
+/// Re-read channel list from Discord DOM.
+async fn refresh_channels(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, AppError> {
@@ -77,17 +115,79 @@ async fn resync(
         return Err(AppError::AuthRequired);
     }
 
-    state.store.clear()?;
-    if let Ok(mut s) = state.monitor_status.write() {
-        *s = "resyncing".to_string();
-    }
-    state.resync_notify.notify_one();
+    use crate::agent_browser::client::AgentBrowserClient;
+    use crate::agent_browser::types::AgentBrowserOptions;
 
+    let client = AgentBrowserClient::new(AgentBrowserOptions {
+        binary: state.config.agent_browser.binary.clone(),
+        session_name: state.config.agent_browser.session_name.clone(),
+        timeout_secs: state.config.agent_browser.timeout_secs,
+    });
+
+    let guild_id = state.config.discord.guild_id();
+    client.open(&state.config.discord.server_url).await?;
+    client.wait_ms(2000).await?;
+
+    let channels = crate::scraper::list_channels(
+        &client,
+        &guild_id,
+        &state.config.discord.server_url,
+    ).await?;
+
+    state.server_store.upsert_channels(&channels)?;
+
+    let all = state.server_store.get_all_channels()?;
+    Ok((StatusCode::OK, Json(json!({
+        "ok": true,
+        "channels": all,
+    }))))
+}
+
+/// Add a channel to monitoring.
+async fn add_monitor(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(channel_id): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    if !check_auth(&headers, &state.config.auth) {
+        return Err(AppError::AuthRequired);
+    }
+    state.server_store.add_monitored(&channel_id)?;
+    state.monitor_notify.notify_one();
+    Ok((StatusCode::OK, Json(json!({ "ok": true }))))
+}
+
+/// Remove a channel from monitoring (keeps data).
+async fn remove_monitor(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(channel_id): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    if !check_auth(&headers, &state.config.auth) {
+        return Err(AppError::AuthRequired);
+    }
+    state.server_store.remove_monitored(&channel_id)?;
+    state.monitor_notify.notify_one();
+    Ok((StatusCode::OK, Json(json!({ "ok": true }))))
+}
+
+/// Resync a specific channel (clear data + re-scrape).
+async fn resync_channel(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Path(channel_id): Path<String>,
+) -> Result<impl IntoResponse, AppError> {
+    if !check_auth(&headers, &state.config.auth) {
+        return Err(AppError::AuthRequired);
+    }
+    state.server_store.clear_channel_data(&channel_id)?;
+    state.monitor_notify.notify_one();
     Ok((StatusCode::OK, Json(json!({ "ok": true }))))
 }
 
 #[derive(Deserialize)]
 struct MessagesQuery {
+    channel_id: Option<String>,
     before: Option<String>,
     after: Option<String>,
     limit: Option<u32>,
@@ -103,19 +203,25 @@ async fn get_messages(
         return Err(AppError::AuthRequired);
     }
 
+    let channel_id = query.channel_id.as_deref().unwrap_or("");
+    if channel_id.is_empty() {
+        return Err(AppError::InvalidParams("channel_id is required".to_string()));
+    }
+
+    let store = state.server_store.get_message_store(channel_id)?;
     let limit = query.limit.unwrap_or(50).min(200);
 
     let messages = if let Some(before_id) = query.before_id {
-        state.store.get_before_id(before_id, limit)?
+        store.get_before_id(before_id, limit)?
     } else {
-        state.store.get_messages(
+        store.get_messages(
             query.before.as_deref(),
             query.after.as_deref(),
             limit,
         )?
     };
 
-    let total = state.store.count()?;
+    let total = store.count()?;
 
     Ok(Json(json!({
         "ok": true,
@@ -128,6 +234,7 @@ async fn get_messages(
 
 #[derive(Deserialize)]
 struct LatestQuery {
+    channel_id: Option<String>,
     n: Option<u32>,
 }
 
@@ -140,9 +247,15 @@ async fn get_latest(
         return Err(AppError::AuthRequired);
     }
 
+    let channel_id = query.channel_id.as_deref().unwrap_or("");
+    if channel_id.is_empty() {
+        return Err(AppError::InvalidParams("channel_id is required".to_string()));
+    }
+
+    let store = state.server_store.get_message_store(channel_id)?;
     let n = query.n.unwrap_or(20).min(500);
-    let messages = state.store.get_latest(n)?;
-    let total = state.store.count()?;
+    let messages = store.get_latest(n)?;
+    let total = store.count()?;
 
     Ok(Json(json!({
         "ok": true,
@@ -150,4 +263,41 @@ async fn get_latest(
         "count": messages.len(),
         "total": total,
     })))
+}
+
+async fn get_config(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    Json(json!({
+        "ok": true,
+        "poll_interval_secs": state.config.scraper.poll_interval_secs,
+        "max_history_pages": state.config.scraper.max_history_pages,
+    }))
+}
+
+#[derive(Deserialize)]
+struct ConfigUpdate {
+    poll_interval_secs: Option<u64>,
+    max_history_pages: Option<Option<u64>>,
+}
+
+async fn update_config(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(update): Json<ConfigUpdate>,
+) -> Result<impl IntoResponse, AppError> {
+    if !check_auth(&headers, &state.config.auth) {
+        return Err(AppError::AuthRequired);
+    }
+
+    let mut config = state.config.clone();
+    if let Some(interval) = update.poll_interval_secs {
+        config.scraper.poll_interval_secs = interval;
+    }
+    if let Some(pages) = update.max_history_pages {
+        config.scraper.max_history_pages = pages;
+    }
+
+    let path = crate::config::config_path()?;
+    crate::config::save(&path, &config).await?;
+
+    Ok((StatusCode::OK, Json(json!({ "ok": true }))))
 }

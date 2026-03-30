@@ -7,6 +7,7 @@ use tracing::{debug, info};
 use crate::agent_browser::client::AgentBrowserClient;
 use crate::db::ScrapedMessage;
 use crate::errors::{AppError, AppResult};
+use crate::server_store::ChannelInfo;
 
 #[derive(Debug, Deserialize)]
 struct ScrollInfo {
@@ -161,6 +162,138 @@ fn scroll_to_script(pos: u64) -> String {
         pos
     )
 }
+
+// ── Channel list scraping ────────────────────────────────────────────────────
+
+/// JavaScript to collect visible channel items from the channel sidebar.
+/// Extracts channel_id from `data-list-item-id="channels___<id>"` and
+/// channel name/type from `aria-label`.
+const COLLECT_CHANNELS_SCRIPT: &str = r#"JSON.stringify((function() {
+    var results = [];
+    var seen = {};
+    var els = document.querySelectorAll('[data-list-item-id^=channels___]');
+    els.forEach(function(el) {
+        var listId = el.getAttribute('data-list-item-id') || '';
+        var channelId = listId.replace('channels___', '');
+        if (!channelId || !/^\d+$/.test(channelId)) return;
+        if (seen[channelId]) return;
+        seen[channelId] = true;
+
+        var label = (el.getAttribute('aria-label') || el.textContent || '').trim();
+        if (!label) return;
+        if (/\bcategory\b/i.test(label)) return;
+
+        var name = label;
+        var type = 'Text';
+
+        var commaM = label.match(/^(.+?)[,\uFF0C]\s*(.+)$/);
+        if (commaM) {
+            name = commaM[1].trim();
+            var rest = commaM[2].toLowerCase();
+            if (rest.indexOf('voice') !== -1) type = 'Voice';
+            else if (rest.indexOf('forum') !== -1) type = 'Forum';
+            else if (rest.indexOf('announcement') !== -1) type = 'Announcement';
+            else if (rest.indexOf('stage') !== -1) type = 'Stage';
+        }
+
+        results.push({ channelId: channelId, name: name.substring(0, 80), type: type });
+    });
+    return results;
+})())"#;
+
+/// JavaScript to get scroll info for the channel sidebar scroller.
+const CHANNEL_SCROLL_INFO_SCRIPT: &str = r#"JSON.stringify((function() {
+    var all = document.querySelectorAll('[class*=scroller]');
+    var best = null;
+    var bestH = 0;
+    for (var i = 0; i < all.length; i++) {
+        var el = all[i];
+        if (el.scrollHeight > el.clientHeight && el.scrollHeight > bestH) {
+            if (el.querySelector('[data-list-item-id^=channels___]')) {
+                best = el;
+                bestH = el.scrollHeight;
+            }
+        }
+    }
+    if (!best) { return { scroll_height: 0, client_height: 0 }; }
+    best.scrollTop = 0;
+    return { scroll_height: best.scrollHeight, client_height: best.clientHeight };
+})())"#;
+
+/// List all channels in the current Discord server by scrolling through
+/// the channel sidebar and collecting channel items.
+pub async fn list_channels(
+    client: &AgentBrowserClient,
+    guild_id: &str,
+    server_url: &str,
+) -> AppResult<Vec<ChannelInfo>> {
+    #[derive(Deserialize)]
+    struct RawChannel {
+        #[serde(rename = "channelId")]
+        channel_id: String,
+        name: String,
+        #[serde(rename = "type")]
+        channel_type: String,
+    }
+
+    #[derive(Deserialize)]
+    struct ChannelScrollInfo {
+        scroll_height: f64,
+        client_height: f64,
+    }
+
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut all: Vec<ChannelInfo> = Vec::new();
+
+    // Get scroll dimensions and reset to top
+    let info: ChannelScrollInfo = client.eval_json(CHANNEL_SCROLL_INFO_SCRIPT).await?;
+    client.wait_ms(300).await?;
+
+    // Scroll through the channel list collecting items
+    let step = info.client_height.max(200.0);
+    let mut pos = 0.0f64;
+
+    loop {
+        let batch: Vec<RawChannel> = client.eval_json(COLLECT_CHANNELS_SCRIPT).await?;
+        for raw in batch {
+            if seen.insert(raw.channel_id.clone()) {
+                let channel_url = format!("{}/{}", server_url.trim_end_matches('/'), raw.channel_id);
+                all.push(ChannelInfo {
+                    channel_id: raw.channel_id,
+                    name: raw.name,
+                    channel_type: raw.channel_type,
+                    channel_url,
+                    monitored: false,
+                });
+            }
+        }
+
+        pos += step;
+        if pos >= info.scroll_height {
+            break;
+        }
+
+        // Scroll the channel sidebar
+        let scroll_js = format!(
+            "(function(){{ \
+                var all = document.querySelectorAll('[class*=scroller]'); \
+                for (var i=0; i<all.length; i++) {{ \
+                    if (all[i].querySelector('[data-list-item-id^=channels___]')) {{ \
+                        all[i].scrollTop = {}; break; \
+                    }} \
+                }} \
+            }})()",
+            pos as u64
+        );
+        client.eval(&scroll_js).await?;
+        client.wait_ms(300).await?;
+    }
+
+    info!("Found {} channels in server", all.len());
+    Ok(all)
+}
+
+// ── Channel navigation & message scraping ────────────────────────────────────
 
 /// Open the Discord channel URL in the browser and verify the page loaded correctly.
 ///
@@ -403,7 +536,7 @@ async fn wait_for_scroll_stable(client: &AgentBrowserClient) -> AppResult<Scroll
 /// Strategy:
 /// 1. Phase 1: Scroll to top repeatedly to trigger Discord to load all history.
 ///    Each scroll-to-top increases scroll_height as older messages load.
-///    Stop when scroll_height stabilizes (channel beginning reached).
+///    Stop when scroll_height stabilizes (channel beginning reached) or max_pages reached.
 /// 2. Phase 2: Sweep page-by-page from top to bottom, collecting all messages.
 ///    No page limit — runs until it naturally reaches the bottom.
 ///
@@ -411,10 +544,10 @@ async fn wait_for_scroll_stable(client: &AgentBrowserClient) -> AppResult<Scroll
 /// so we MUST sweep through every position to collect all messages.
 pub async fn scrape_history(
     client: &AgentBrowserClient,
+    max_pages: Option<u64>,
 ) -> AppResult<Vec<ScrapedMessage>> {
-    // Phase 1: Scroll to the absolute top until scroll_height stabilizes.
-    // No attempt limit — keep going until Discord has loaded all history.
-    info!("Phase 1: Loading all history by scrolling to top...");
+    // Phase 1: Scroll to the absolute top until scroll_height stabilizes or max_pages reached.
+    info!("Phase 1: Loading history (max_pages={:?})...", max_pages);
     let mut prev_scroll_height = 0.0f64;
     let mut top_attempts = 0u64;
 
@@ -424,7 +557,7 @@ pub async fn scrape_history(
 
         top_attempts += 1;
         debug!(
-            "Top attempt {}: scroll_height={:.0}, prev={:.0}",
+            "Top attempt : scroll_height={:.0}, prev={:.0}",
             top_attempts, info.scroll_height, prev_scroll_height
         );
 
@@ -434,6 +567,16 @@ pub async fn scrape_history(
                 top_attempts, info.scroll_height
             );
             break;
+        }
+
+        if let Some(max) = max_pages {
+            if top_attempts >= max {
+                info!(
+                    "Reached max_pages limit ({}) at scroll_height={:.0}",
+                    max, info.scroll_height
+                );
+                break;
+            }
         }
 
         prev_scroll_height = info.scroll_height;
@@ -478,9 +621,23 @@ async fn sweep_to_bottom(
         let new_top = info.scroll_top + step;
 
         if info.scroll_top + info.client_height >= info.scroll_height - 1.0 {
-            // At the bottom — one final collect to catch the last messages
-            client.eval(SCROLL_TO_BOTTOM_SCRIPT).await?;
-            client.wait_ms(500).await?;
+            // Reached bottom — confirm by scrolling to bottom until scroll_height stabilizes
+            let mut prev_height = info.scroll_height;
+            let mut stable = 0;
+            loop {
+                client.eval(SCROLL_TO_BOTTOM_SCRIPT).await?;
+                let check = wait_for_scroll_stable(client).await?;
+                if (check.scroll_height - prev_height).abs() < 1.0 {
+                    stable += 1;
+                    if stable >= 2 {
+                        break;
+                    }
+                } else {
+                    stable = 0;
+                }
+                prev_height = check.scroll_height;
+            }
+            // Final collect
             let batch = collect_visible_messages(client).await?;
             for msg in batch {
                 if seen.insert(msg.dedup_hash.clone()) {

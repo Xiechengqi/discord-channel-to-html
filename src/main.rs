@@ -7,17 +7,16 @@ mod errors;
 mod monitor;
 mod scraper;
 mod server;
+mod server_store;
 
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 use clap::Parser;
-use tokio::sync::Notify;
-use tokio::time::{Duration, sleep};
 use tracing::{error, info};
 
 #[derive(Parser)]
 #[command(name = "discord-channel-to-html")]
-#[command(about = "Monitor a Discord channel and serve messages as HTML + JSON API")]
+#[command(about = "Monitor Discord server channels and serve messages as HTML + JSON API")]
 struct Cli {
     #[arg(long, help = "Override server host")]
     host: Option<String>,
@@ -46,18 +45,18 @@ async fn main() {
         config.server.port = port;
     }
 
-    if config.discord.channel_url.is_empty() {
+    if config.discord.server_url.is_empty() {
         eprintln!(
-            "Error: discord.channel_url must be set in config.\n\
-             Example: channel_url = \"https://discord.com/channels/799672011265015819/1162768567821930597\"\n\
+            "Error: discord.server_url must be set in config.\n\
+             Example: server_url = \"https://discord.com/channels/799672011265015819\"\n\
              Config file: {}",
             config::config_path().unwrap_or_default().display()
         );
         std::process::exit(1);
     }
 
-    let db_path = config::expand_path(&config.database.path);
-    let store = match db::MessageStore::new(&db_path) {
+    let data_dir = config::expand_path(&config.database.path);
+    let server_store = match server_store::ServerStore::new(&data_dir) {
         Ok(s) => Arc::new(s),
         Err(e) => {
             eprintln!("Failed to initialize database: {e}");
@@ -65,58 +64,18 @@ async fn main() {
         }
     };
 
-    // Shared state for resync coordination
-    let resync_notify = Arc::new(Notify::new());
-    let monitor_status: Arc<RwLock<String>> = Arc::new(RwLock::new("starting".to_string()));
-
     info!(
-        "Starting discord-channel-to-html: channel_url={}",
-        config.discord.channel_url
+        "Starting discord-channel-to-html: server_url={}",
+        config.discord.server_url
     );
 
-    // Monitor runs in a restart loop: when resync_notify fires, the current
-    // monitor run is cancelled and a fresh one starts from scratch.
-    let monitor_store = store.clone();
-    let monitor_config = config.clone();
-    let monitor_resync = resync_notify.clone();
-    let monitor_status_ref = monitor_status.clone();
-    let monitor_handle = tokio::spawn(async move {
-        loop {
-            let mon = monitor::Monitor::new(
-                monitor_config.clone(),
-                monitor_store.clone(),
-                monitor_status_ref.clone(),
-            );
-            tokio::select! {
-                result = mon.run() => {
-                    match result {
-                        Ok(()) => info!("Monitor exited cleanly"),
-                        Err(e) if e.is_wrong_location() => {
-                            eprintln!("\nError: {e}\n");
-                            std::process::exit(1);
-                        }
-                        Err(e) => error!("Monitor error: {e}"),
-                    }
-                    // Brief pause before restarting on unexpected exit
-                    sleep(Duration::from_secs(5)).await;
-                }
-                _ = monitor_resync.notified() => {
-                    info!("Resync triggered — restarting monitor");
-                }
-            }
-        }
-    });
-
-    let server_store = store.clone();
-    let server_config = config.clone();
     let server_handle = tokio::spawn(async move {
-        if let Err(e) = server::serve(server_config, server_store, resync_notify, monitor_status).await {
+        if let Err(e) = server::serve(config, server_store).await {
             error!("Server error: {e}");
         }
     });
 
     tokio::select! {
-        _ = monitor_handle => error!("Monitor exited unexpectedly"),
         _ = server_handle => error!("Server exited unexpectedly"),
         _ = tokio::signal::ctrl_c() => info!("Shutting down"),
     }
