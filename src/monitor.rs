@@ -45,17 +45,26 @@ impl Monitor {
         )
         .await?;
 
-        // ── Phase 1: Full history scrape ─────────────────────────────────────
-        self.set_status("loading_history");
-        info!(
-            "Starting initial history scrape (max_top_attempts={})...",
-            self.config.scraper.initial_scroll_pages
-        );
-        let history =
-            scraper::scrape_history(&client, self.config.scraper.initial_scroll_pages).await?;
+        // ── Initial load: full scrape or fast catch-up ───────────────────────
+        let existing_count = self.store.count().unwrap_or(0);
+        let history = if existing_count == 0 {
+            self.set_status("loading_history");
+            info!(
+                "DB is empty — starting full history scrape (max_pages={})...",
+                self.config.scraper.initial_scroll_pages
+            );
+            scraper::scrape_history(&client, self.config.scraper.initial_scroll_pages).await?
+        } else {
+            self.set_status("catching_up");
+            info!(
+                "DB has {} messages — catching up from current position...",
+                existing_count
+            );
+            scraper::catch_up_to_bottom(&client, self.config.scraper.initial_scroll_pages).await?
+        };
         let inserted = self.store.insert_batch(&history)?;
         info!(
-            "History scrape complete: {} messages scraped, {} new inserted",
+            "Initial load complete: {} messages collected, {} new inserted",
             history.len(),
             inserted
         );

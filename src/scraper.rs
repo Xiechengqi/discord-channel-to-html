@@ -445,11 +445,22 @@ pub async fn scrape_history(
         }
     }
 
-    // Phase 2: Sweep from top to bottom, collecting all visible messages at each position.
+    // Phase 2: sweep downward from top to bottom.
     info!("Phase 2: Sweeping downward to collect messages...");
     client.eval(SCROLL_TO_TOP_SCRIPT).await?;
     client.wait_ms(1000).await?;
 
+    let messages = sweep_to_bottom(client, max_pages).await?;
+    info!("History scrape complete: {} messages", messages.len());
+    Ok(messages)
+}
+
+/// Sweep downward from the current scroll position to the bottom, collecting all messages.
+/// Used by both `scrape_history` (Phase 2) and `catch_up_to_bottom`.
+async fn sweep_to_bottom(
+    client: &AgentBrowserClient,
+    max_pages: u64,
+) -> AppResult<Vec<ScrapedMessage>> {
     let mut seen: HashSet<String> = HashSet::new();
     let mut ordered: Vec<ScrapedMessage> = Vec::new();
     let mut page = 0u64;
@@ -474,13 +485,12 @@ pub async fn scrape_history(
             break;
         }
 
-        // Scroll down by one viewport
         let info: ScrollInfo = client.eval_json(MSG_SCROLL_INFO_SCRIPT).await?;
         let step = info.client_height.max(300.0);
         let new_top = info.scroll_top + step;
 
-        // If we've reached the bottom, do one final collection and stop.
         if info.scroll_top + info.client_height >= info.scroll_height - 1.0 {
+            // At the bottom — one final collect to catch the last messages
             client.eval(SCROLL_TO_BOTTOM_SCRIPT).await?;
             client.wait_ms(500).await?;
             let batch = collect_visible_messages(client).await?;
@@ -492,14 +502,25 @@ pub async fn scrape_history(
             break;
         }
 
-        client
-            .eval(&scroll_to_script(new_top as u64))
-            .await?;
+        client.eval(&scroll_to_script(new_top as u64)).await?;
         client.wait_ms(500).await?;
     }
 
-    info!("History scrape complete: {} messages", ordered.len());
     Ok(ordered)
+}
+
+/// Catch up from the current Discord scroll position to the bottom.
+///
+/// Used on restart when the DB already has historical data. Discord navigates to the
+/// first-unread message (or bottom if fully caught up), so sweeping from there to the
+/// bottom is enough to pick up any messages missed while the service was offline.
+pub async fn catch_up_to_bottom(
+    client: &AgentBrowserClient,
+    max_pages: u64,
+) -> AppResult<Vec<ScrapedMessage>> {
+    // Brief wait for Discord to finish rendering after navigation
+    client.wait_ms(1000).await?;
+    sweep_to_bottom(client, max_pages).await
 }
 
 /// Poll for new messages without any scrolling.
