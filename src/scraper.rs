@@ -1,0 +1,577 @@
+use std::collections::HashSet;
+
+use serde::Deserialize;
+use serde_json::Value;
+use tracing::{debug, info, warn};
+
+use crate::agent_browser::client::AgentBrowserClient;
+use crate::db::ScrapedMessage;
+use crate::errors::{AppError, AppResult};
+
+#[derive(Debug, Deserialize)]
+struct ScrollInfo {
+    scroll_height: f64,
+    client_height: f64,
+    scroll_top: f64,
+}
+
+/// Collects all visible messages, including image/video placeholders for media attachments.
+///
+/// For each message node we:
+/// 1. Extract text content from the message-content element.
+/// 2. Count images (`[class*="imageWrapper"]`) and videos (`video` elements) that are
+///    siblings/descendants of the message container but NOT inside the reply-reference block.
+/// 3. Append "[图片]" / "[视频]" placeholders so media-only messages are not stored as empty,
+///    and mixed messages don't silently lose the fact that media was present.
+///
+/// Reply references are intentionally ignored — the replied-to text is excluded so it
+/// doesn't pollute the actual message content.
+const COLLECT_SCRIPT: &str = r#"JSON.stringify((function() {
+    var results = [];
+    var msgNodes = document.querySelectorAll('[class*="message"]');
+    var idx = 0;
+    msgNodes.forEach(function(node) {
+        var authorEl = node.querySelector('[class*="username"], [class*="headerText"] span, [class*="author"]');
+        var timeEl = node.querySelector('time, [class*="timestamp"]');
+        var contentEl = node.querySelector('[id^="message-content-"], [class*="messageContent"]');
+
+        // contentEl is our anchor: Discord always renders it even for media-only messages.
+        // Without it we're likely hitting a non-message UI node (date separator, etc.) — skip.
+        if (!contentEl) return;
+
+        var msgId = '';
+        var idAttr = contentEl.getAttribute('id') || '';
+        if (idAttr.startsWith('message-content-')) {
+            msgId = idAttr.replace('message-content-', '');
+        }
+
+        // Text content — strip the reply-reference block first so its text doesn't bleed in.
+        var replyRef = node.querySelector('[class*="repliedMessage"], [class*="replyContext"]');
+        var textContent = '';
+        if (replyRef) {
+            // Clone node, remove the reply block, then read textContent
+            var clone = contentEl.cloneNode(true);
+            var cloneReply = clone.querySelector('[class*="repliedMessage"], [class*="replyContext"]');
+            if (cloneReply) cloneReply.remove();
+            textContent = clone.textContent.trim();
+        } else {
+            textContent = (contentEl.textContent || '').trim();
+        }
+
+        // Media detection: look in the message container, excluding the reply-reference subtree.
+        // We count unique image wrappers and video elements.
+        var imgCount = 0;
+        var videoCount = 0;
+        var imageWrappers = node.querySelectorAll('[class*="imageWrapper"], [class*="attachedFiles"] img');
+        imageWrappers.forEach(function(el) {
+            // Exclude anything inside the reply reference
+            if (replyRef && replyRef.contains(el)) return;
+            imgCount++;
+        });
+        var videoEls = node.querySelectorAll('video');
+        videoEls.forEach(function(el) {
+            if (replyRef && replyRef.contains(el)) return;
+            videoCount++;
+        });
+
+        // Build combined content
+        var parts = [];
+        if (textContent) parts.push(textContent);
+        for (var i = 0; i < imgCount; i++) parts.push('[图片]');
+        for (var i = 0; i < videoCount; i++) parts.push('[视频]');
+        var combined = parts.join(' ');
+
+        // Skip nodes that produced nothing (true UI noise)
+        if (!combined && !authorEl) return;
+
+        results.push({
+            author: authorEl ? authorEl.textContent.trim() : '',
+            time: timeEl ? (timeEl.getAttribute('datetime') || timeEl.textContent.trim()) : '',
+            message: combined,
+            msgId: msgId,
+            domIndex: idx
+        });
+        idx++;
+    });
+    return results;
+})())"#;
+
+const MSG_SCROLL_INFO_SCRIPT: &str = r#"JSON.stringify((function() {
+    var scrollers = document.querySelectorAll('[class*="scroller"]');
+    var best = null;
+    var bestH = 0;
+    for (var i = 0; i < scrollers.length; i++) {
+        var el = scrollers[i];
+        if (el.scrollHeight > el.clientHeight && el.scrollHeight > bestH) {
+            if (el.querySelector('[class*="message"]')) {
+                best = el;
+                bestH = el.scrollHeight;
+            }
+        }
+    }
+    if (!best) return { scroll_height: 0, client_height: 0, scroll_top: 0 };
+    return { scroll_height: best.scrollHeight, client_height: best.clientHeight, scroll_top: best.scrollTop };
+})())"#;
+
+const SCROLL_TO_TOP_SCRIPT: &str = r#"(function() {
+    var scrollers = document.querySelectorAll('[class*="scroller"]');
+    for (var i = 0; i < scrollers.length; i++) {
+        var el = scrollers[i];
+        if (el.scrollHeight > el.clientHeight && el.querySelector('[class*="message"]')) {
+            el.scrollTop = 0;
+            return;
+        }
+    }
+})()"#;
+
+const SCROLL_TO_BOTTOM_SCRIPT: &str = r#"(function() {
+    var scrollers = document.querySelectorAll('[class*="scroller"]');
+    for (var i = 0; i < scrollers.length; i++) {
+        var el = scrollers[i];
+        if (el.scrollHeight > el.clientHeight && el.querySelector('[class*="message"]')) {
+            el.scrollTop = el.scrollHeight;
+            return;
+        }
+    }
+})()"#;
+
+fn scroll_to_script(pos: u64) -> String {
+    format!(
+        r#"(function() {{
+            var scrollers = document.querySelectorAll('[class*="scroller"]');
+            for (var i = 0; i < scrollers.length; i++) {{
+                var el = scrollers[i];
+                if (el.querySelector('[class*="message"]')) {{
+                    el.scrollTop = {};
+                    return;
+                }}
+            }}
+        }})()"#,
+        pos
+    )
+}
+
+/// Verify that the browser is currently viewing the expected Discord server and channel.
+///
+/// Reads the active guild nav item and the selected channel item from the DOM.
+/// Returns `Ok(())` if both match (case-insensitive substring match, same logic as navigation).
+/// Returns `Err(AppError::WrongLocation(...))` otherwise, with a clear diagnostic message.
+pub async fn check_current_location(
+    client: &AgentBrowserClient,
+    expected_server: &str,
+    expected_channel: &str,
+) -> AppResult<()> {
+    const CHECK_SCRIPT: &str = r#"JSON.stringify((function() {
+        var serverName = '';
+        var guildItems = document.querySelectorAll('[data-list-item-id*="guildsnav___"]');
+        for (var i = 0; i < guildItems.length; i++) {
+            var el = guildItems[i];
+            var listId = el.getAttribute('data-list-item-id') || '';
+            if (!/guildsnav___\d{10,}/.test(listId)) continue;
+            var cls = el.getAttribute('class') || '';
+            var selected = cls.indexOf('selected') !== -1 || el.getAttribute('aria-selected') === 'true';
+            if (!selected) continue;
+            var name = (el.textContent || '').trim();
+            name = name.replace(/^[\d][\d,.]*\s*[^\uff0c,]*[\uff0c,]\s*/, '').trim();
+            serverName = name;
+            break;
+        }
+
+        var channelName = '';
+        var channelItems = document.querySelectorAll('[data-list-item-id^="channels___"]');
+        for (var i = 0; i < channelItems.length; i++) {
+            var el = channelItems[i];
+            var cls = el.getAttribute('class') || '';
+            var selected = cls.indexOf('selected') !== -1 || el.getAttribute('aria-selected') === 'true';
+            if (!selected) continue;
+            var label = (el.getAttribute('aria-label') || el.textContent || '').trim();
+            var commaIdx = label.search(/[,\uff0c]/);
+            channelName = commaIdx !== -1 ? label.substring(0, commaIdx).trim() : label;
+            break;
+        }
+
+        return { serverName: serverName, channelName: channelName };
+    })())"#;
+
+    #[derive(Deserialize)]
+    struct LocationResult {
+        #[serde(rename = "serverName")]
+        server_name: String,
+        #[serde(rename = "channelName")]
+        channel_name: String,
+    }
+
+    let loc: LocationResult = client.eval_json(CHECK_SCRIPT).await?;
+
+    let server_ok = loc.server_name.to_lowercase().contains(&expected_server.to_lowercase());
+    let channel_ok = loc.channel_name.to_lowercase().contains(&expected_channel.to_lowercase());
+
+    if server_ok && channel_ok {
+        info!(
+            "Location check passed: server='{}', channel='{}'",
+            loc.server_name, loc.channel_name
+        );
+        Ok(())
+    } else {
+        let msg = format!(
+            "Browser is on server='{}' channel='{}', but config expects server='{}' channel='{}'. \
+             Please open Discord in your browser and navigate to the correct channel, then restart.",
+            loc.server_name, loc.channel_name, expected_server, expected_channel
+        );
+        Err(AppError::WrongLocation(msg))
+    }
+}
+
+#[allow(dead_code)]
+/// Navigate to the given server and channel in Discord Web UI.
+pub async fn navigate_to_channel(
+    client: &AgentBrowserClient,
+    server: &str,
+    channel: &str,
+) -> AppResult<()> {
+    if !server.is_empty() {
+        let target = serde_json::to_string(server).unwrap_or_else(|_| "\"\"".to_string());
+        let script = format!(
+            r#"JSON.stringify((function(target) {{
+                var target_lower = target.toLowerCase();
+                var items = document.querySelectorAll('[data-list-item-id*="guildsnav___"]');
+                for (var i = 0; i < items.length; i++) {{
+                    var el = items[i];
+                    var listId = el.getAttribute('data-list-item-id') || '';
+                    if (!/guildsnav___\d{{10,}}/.test(listId)) continue;
+                    var name = (el.textContent || '').trim();
+                    name = name.replace(/^[\d][\d,.]*\s*[^\uff0c,]*[\uff0c,]\s*/, '');
+                    name = name.trim();
+                    if (name.toLowerCase().indexOf(target_lower) === -1) continue;
+                    var cls = el.getAttribute('class') || '';
+                    if (cls.indexOf('selected') !== -1) {{
+                        return {{ status: 'already_on' }};
+                    }}
+                    el.click();
+                    return {{ status: 'switched' }};
+                }}
+                return {{ status: 'not_found' }};
+            }})({}))"#,
+            target
+        );
+
+        #[derive(Deserialize)]
+        struct SwitchResult {
+            status: String,
+        }
+
+        let res: SwitchResult = client.eval_json(&script).await?;
+        match res.status.as_str() {
+            "not_found" => {
+                return Err(AppError::InvalidParams(format!(
+                    "server not found: {}",
+                    server
+                )));
+            }
+            "switched" => {
+                client.wait_ms(1000).await?;
+            }
+            _ => {} // already_on
+        }
+    }
+
+    if !channel.is_empty() {
+        let target = serde_json::to_string(channel).unwrap_or_else(|_| "\"\"".to_string());
+        let try_click = format!(
+            r#"JSON.stringify((function(target) {{
+                var target_lower = target.toLowerCase();
+                var els = document.querySelectorAll('[data-list-item-id^=channels___]');
+                for (var i = 0; i < els.length; i++) {{
+                    var el = els[i];
+                    var label = (el.getAttribute('aria-label') || el.textContent || '').trim();
+                    var commaIdx = label.search(/[,\uFF0C]/);
+                    var name = commaIdx !== -1 ? label.substring(0, commaIdx).trim() : label;
+                    if (name.toLowerCase().indexOf(target_lower) === -1) continue;
+                    el.click();
+                    return {{ status: 'switched' }};
+                }}
+                return {{ status: 'not_found' }};
+            }})({}))"#,
+            target
+        );
+
+        #[derive(Deserialize)]
+        struct SwitchResult {
+            status: String,
+        }
+
+        let res: SwitchResult = client.eval_json(&try_click).await?;
+        if res.status != "switched" {
+            // Scroll through channel list to find the channel
+            let ch_scroll_info: &str = r#"JSON.stringify((function() {
+                var all = document.querySelectorAll('[class*=scroller]');
+                var best = null;
+                var bestH = 0;
+                for (var i = 0; i < all.length; i++) {
+                    var el = all[i];
+                    if (el.scrollHeight > el.clientHeight && el.scrollHeight > bestH) {
+                        if (el.querySelector('[data-list-item-id^=channels___]')) {
+                            best = el;
+                            bestH = el.scrollHeight;
+                        }
+                    }
+                }
+                if (!best) { return { scroll_height: 0, client_height: 0, scroll_top: 0 }; }
+                best.scrollTop = 0;
+                return { scroll_height: best.scrollHeight, client_height: best.clientHeight, scroll_top: 0 };
+            })())"#;
+
+            let info: ScrollInfo = client.eval_json(ch_scroll_info).await?;
+            client.wait_ms(300).await?;
+
+            let mut found = false;
+            if info.scroll_height > info.client_height {
+                let step = info.client_height.max(200.0);
+                let mut pos = step;
+                while pos < info.scroll_height + step {
+                    let scroll_js = format!(
+                        "(function(){{ \
+                            var all = document.querySelectorAll('[class*=scroller]'); \
+                            for (var i=0; i<all.length; i++) {{ \
+                                if (all[i].querySelector('[data-list-item-id^=channels___]')) {{ \
+                                    all[i].scrollTop = {}; break; \
+                                }} \
+                            }} \
+                        }})()",
+                        pos as u64
+                    );
+                    client.eval(&scroll_js).await?;
+                    client.wait_ms(300).await?;
+
+                    let res: SwitchResult = client.eval_json(&try_click).await?;
+                    if res.status == "switched" {
+                        found = true;
+                        break;
+                    }
+                    pos += step;
+                }
+            }
+
+            if !found {
+                return Err(AppError::InvalidParams(format!(
+                    "channel not found: {}",
+                    channel
+                )));
+            }
+        }
+
+        client.wait_ms(1000).await?;
+    }
+
+    Ok(())
+}
+
+/// Collect all currently visible messages in the chat area.
+pub async fn collect_visible_messages(
+    client: &AgentBrowserClient,
+) -> AppResult<Vec<ScrapedMessage>> {
+    let batch: Vec<serde_json::Map<String, Value>> = client.eval_json(COLLECT_SCRIPT).await?;
+    let mut messages = Vec::new();
+
+    for item in batch {
+        let author = item
+            .get("author")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let time = item
+            .get("time")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let msg = item
+            .get("message")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let msg_id = item
+            .get("msgId")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        if msg.is_empty() && author.is_empty() {
+            continue;
+        }
+        messages.push(ScrapedMessage::new(author, time, msg, msg_id));
+    }
+
+    Ok(messages)
+}
+
+/// Wait for Discord to finish loading history (scroll_height stabilizes).
+async fn wait_for_scroll_stable(client: &AgentBrowserClient) -> AppResult<ScrollInfo> {
+    let mut prev_height = 0.0f64;
+    let mut stable_count = 0u32;
+
+    loop {
+        client.wait_ms(500).await?;
+        let info: ScrollInfo = client.eval_json(MSG_SCROLL_INFO_SCRIPT).await?;
+
+        if (info.scroll_height - prev_height).abs() < 1.0 {
+            stable_count += 1;
+            if stable_count >= 3 {
+                return Ok(info);
+            }
+        } else {
+            stable_count = 0;
+        }
+        prev_height = info.scroll_height;
+    }
+}
+
+/// Scrape full message history by repeatedly scrolling to the top until no more
+/// history loads, then sweeping downward to collect everything.
+///
+/// Strategy:
+/// 1. Scroll to top repeatedly — each time we hit top, Discord loads older messages,
+///    increasing scroll_height. Keep scrolling to top until scroll_height stabilizes.
+/// 2. Once at the true top, sweep downward page-by-page collecting all messages.
+pub async fn scrape_history(
+    client: &AgentBrowserClient,
+    max_pages: u64,
+) -> AppResult<Vec<ScrapedMessage>> {
+    // Phase 1: Scroll to the absolute top, waiting for all history to load.
+    info!("Phase 1: Loading all history by scrolling to top...");
+    let mut prev_scroll_height = 0.0f64;
+    let mut top_attempts = 0u64;
+    let max_top_attempts = max_pages; // reuse as a safety limit
+
+    loop {
+        client.eval(SCROLL_TO_TOP_SCRIPT).await?;
+        let info = wait_for_scroll_stable(client).await?;
+
+        debug!(
+            "Top attempt {}: scroll_height={:.0}, prev={:.0}",
+            top_attempts, info.scroll_height, prev_scroll_height
+        );
+
+        // If scroll_height didn't grow, we've reached the beginning of the channel.
+        if (info.scroll_height - prev_scroll_height).abs() < 1.0 {
+            info!(
+                "Reached channel beginning (scroll_height stable at {:.0})",
+                info.scroll_height
+            );
+            break;
+        }
+
+        prev_scroll_height = info.scroll_height;
+        top_attempts += 1;
+
+        if top_attempts >= max_top_attempts {
+            warn!(
+                "Reached max top-scroll attempts ({}), proceeding with collection",
+                max_top_attempts
+            );
+            break;
+        }
+    }
+
+    // Phase 2: Sweep from top to bottom, collecting all visible messages at each position.
+    info!("Phase 2: Sweeping downward to collect messages...");
+    client.eval(SCROLL_TO_TOP_SCRIPT).await?;
+    client.wait_ms(1000).await?;
+
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut ordered: Vec<ScrapedMessage> = Vec::new();
+    let mut page = 0u64;
+
+    loop {
+        let batch = collect_visible_messages(client).await?;
+        let mut new_in_batch = 0;
+        for msg in batch {
+            if seen.insert(msg.dedup_hash.clone()) {
+                ordered.push(msg);
+                new_in_batch += 1;
+            }
+        }
+        debug!(
+            "Sweep page {}: {} new messages (total {})",
+            page, new_in_batch, ordered.len()
+        );
+
+        page += 1;
+        if page >= max_pages {
+            info!("Reached max sweep pages ({})", max_pages);
+            break;
+        }
+
+        // Scroll down by one viewport
+        let info: ScrollInfo = client.eval_json(MSG_SCROLL_INFO_SCRIPT).await?;
+        let step = info.client_height.max(300.0);
+        let new_top = info.scroll_top + step;
+
+        // If we've reached the bottom, done.
+        if info.scroll_top + info.client_height >= info.scroll_height - 1.0 {
+            break;
+        }
+
+        client
+            .eval(&scroll_to_script(new_top as u64))
+            .await?;
+        client.wait_ms(500).await?;
+    }
+
+    info!("History scrape complete: {} messages", ordered.len());
+    Ok(ordered)
+}
+
+/// Scrape recent messages by scrolling up a few pages from the bottom.
+/// This catches messages that arrived between polls even if they exceed one viewport.
+pub async fn scrape_recent(
+    client: &AgentBrowserClient,
+    pages: u64,
+) -> AppResult<Vec<ScrapedMessage>> {
+    // Start at the bottom
+    client.eval(SCROLL_TO_BOTTOM_SCRIPT).await?;
+    client.wait_ms(300).await?;
+
+    let info: ScrollInfo = client.eval_json(MSG_SCROLL_INFO_SCRIPT).await?;
+    let step = info.client_height.max(300.0);
+
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut all: Vec<ScrapedMessage> = Vec::new();
+
+    // Scroll up `pages` times to cover more than one viewport
+    let scroll_up_to = (info.scroll_top - step * pages as f64).max(0.0);
+    client
+        .eval(&scroll_to_script(scroll_up_to as u64))
+        .await?;
+    client.wait_ms(500).await?;
+
+    // Now sweep back down to bottom, collecting everything
+    let mut pos = scroll_up_to;
+    loop {
+        let batch = collect_visible_messages(client).await?;
+        for msg in batch {
+            if seen.insert(msg.dedup_hash.clone()) {
+                all.push(msg);
+            }
+        }
+
+        let current: ScrollInfo = client.eval_json(MSG_SCROLL_INFO_SCRIPT).await?;
+        if current.scroll_top + current.client_height >= current.scroll_height - 1.0 {
+            break;
+        }
+
+        pos += step;
+        client.eval(&scroll_to_script(pos as u64)).await?;
+        client.wait_ms(300).await?;
+    }
+
+    // Final collection at the very bottom
+    client.eval(SCROLL_TO_BOTTOM_SCRIPT).await?;
+    client.wait_ms(300).await?;
+    let batch = collect_visible_messages(client).await?;
+    for msg in batch {
+        if seen.insert(msg.dedup_hash.clone()) {
+            all.push(msg);
+        }
+    }
+
+    Ok(all)
+}

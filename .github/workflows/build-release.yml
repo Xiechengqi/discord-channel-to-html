@@ -1,0 +1,149 @@
+name: Build and Release
+
+on:
+  push:
+    branches:
+      - master
+
+permissions:
+  contents: write
+
+jobs:
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Build frontend
+        run: cd frontend && npm install && npm run build
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: frontend-out
+          path: frontend/out
+
+  build:
+    needs: frontend
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - target: amd64
+            rust_target: x86_64-unknown-linux-musl
+          - target: arm64
+            rust_target: aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - uses: dtolnay/rust-toolchain@1.88.0
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.13.0
+
+      - name: Cache cargo-zigbuild
+        uses: actions/cache@v4
+        with:
+          path: ~/.cargo/bin/cargo-zigbuild
+          key: cargo-zigbuild-${{ runner.os }}
+
+      - name: Install cargo-zigbuild
+        run: cargo install cargo-zigbuild
+
+      - name: Add musl target
+        run: rustup target add ${{ matrix.rust_target }}
+
+      - name: Download frontend
+        uses: actions/download-artifact@v4
+        with:
+          name: frontend-out
+          path: frontend/out
+
+      - name: Build
+        run: cargo zigbuild --release --target ${{ matrix.rust_target }}
+
+      - name: Prepare asset
+        run: |
+          mv target/${{ matrix.rust_target }}/release/discord-channel-to-html \
+             discord-channel-to-html-linux-${{ matrix.target }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: discord-channel-to-html-${{ matrix.target }}
+          path: discord-channel-to-html-linux-${{ matrix.target }}
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release files
+        run: |
+          mkdir -p release-files
+          cp artifacts/discord-channel-to-html-amd64/discord-channel-to-html-linux-amd64 release-files/
+          cp artifacts/discord-channel-to-html-arm64/discord-channel-to-html-linux-arm64 release-files/
+
+      - name: Get version
+        id: version
+        run: |
+          VERSION=$(grep '^version = ' Cargo.toml | head -1 | sed 's/version = "\(.*\)"/\1/')
+          echo "version=${VERSION}" >> $GITHUB_OUTPUT
+
+      - name: Delete existing latest release and tag
+        run: |
+          gh release delete latest --yes || true
+          git push origin :refs/tags/latest || true
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: Create latest tag
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -f latest
+          git push -f origin latest
+
+      - name: Create Latest Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: "Latest Build (v${{ steps.version.outputs.version }})"
+          body: |
+            **版本**: v${{ steps.version.outputs.version }}
+            **提交**: ${{ github.sha }}
+            **时间**: ${{ github.event.head_commit.timestamp }}
+
+            ${{ github.event.head_commit.message }}
+
+            ---
+
+            ### 下载
+
+            - **Linux AMD64**: `discord-channel-to-html-linux-amd64`
+            - **Linux ARM64**: `discord-channel-to-html-linux-arm64`
+
+            ```bash
+            # AMD64
+            wget https://github.com/${{ github.repository }}/releases/download/latest/discord-channel-to-html-linux-amd64 -O discord-channel-to-html && chmod +x discord-channel-to-html
+
+            # ARM64
+            wget https://github.com/${{ github.repository }}/releases/download/latest/discord-channel-to-html-linux-arm64 -O discord-channel-to-html && chmod +x discord-channel-to-html
+            ```
+          files: release-files/*
+          prerelease: false
+          draft: false
