@@ -57,7 +57,7 @@ jobs:
           key: cargo-zigbuild-${{ runner.os }}
 
       - name: Install cargo-zigbuild
-        run: cargo install cargo-zigbuild
+        run: cargo install cargo-zigbuild --force
 
       - name: Add musl target
         run: rustup target add ${{ matrix.rust_target }}
