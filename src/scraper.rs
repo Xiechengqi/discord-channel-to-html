@@ -398,38 +398,72 @@ async fn wait_for_scroll_stable(client: &AgentBrowserClient) -> AppResult<Scroll
     }
 }
 
-/// Scrape full message history by repeatedly scrolling to the top until no more
-/// history loads, then sweeping downward to collect everything.
+/// JavaScript to click Discord's "Jump to Present" bar (appears when scrolled away from bottom).
+const CLICK_JUMP_TO_PRESENT_SCRIPT: &str = r#"JSON.stringify((function() {
+    // Discord renders a bar with class containing "jumpToPresentBar" when you're not at the bottom
+    var bar = document.querySelector('[class*="jumpToPresentBar"]');
+    if (bar) { bar.click(); return true; }
+    // Fallback: look for a button/span with common "jump to present" text
+    var spans = document.querySelectorAll('[class*="barButtonMain"], [class*="jumpToPresentBar"] span');
+    for (var i = 0; i < spans.length; i++) {
+        var el = spans[i];
+        if (el.closest('[class*="jumpToPresentBar"]')) { el.click(); return true; }
+    }
+    return false;
+})())"#;
+
+/// Scrape full message history.
 ///
 /// Strategy:
-/// 1. Scroll to top repeatedly — each time we hit top, Discord loads older messages,
-///    increasing scroll_height. Keep scrolling to top until scroll_height stabilizes.
-/// 2. Once at the true top, sweep downward page-by-page collecting all messages.
+/// 1. Scroll to top repeatedly, collecting visible messages at each stop.
+///    Discord loads older messages each time, increasing scroll_height.
+///    Keep scrolling until scroll_height stabilizes (channel beginning reached).
+/// 2. Once at top, click "Jump to Present" to instantly reach the bottom,
+///    then collect the final visible messages. No slow page-by-page sweep needed.
 pub async fn scrape_history(
     client: &AgentBrowserClient,
     max_pages: u64,
 ) -> AppResult<Vec<ScrapedMessage>> {
-    // Phase 1: Scroll to the absolute top, waiting for all history to load.
-    info!("Phase 1: Loading all history by scrolling to top...");
+    info!("Loading all history by scrolling to top (collecting as we go)...");
     let mut prev_scroll_height = 0.0f64;
     let mut top_attempts = 0u64;
-    let max_top_attempts = max_pages; // reuse as a safety limit
+    let max_top_attempts = max_pages;
+
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut ordered: Vec<ScrapedMessage> = Vec::new();
 
     loop {
+        // Collect visible messages at the current position before scrolling further
+        let batch = collect_visible_messages(client).await?;
+        let mut new_in_batch = 0;
+        for msg in batch {
+            if seen.insert(msg.dedup_hash.clone()) {
+                ordered.push(msg);
+                new_in_batch += 1;
+            }
+        }
+        if new_in_batch > 0 {
+            debug!(
+                "Top attempt {}: collected {} new (total {})",
+                top_attempts, new_in_batch, ordered.len()
+            );
+        }
+
         client.eval(SCROLL_TO_TOP_SCRIPT).await?;
         let info = wait_for_scroll_stable(client).await?;
 
-        debug!(
-            "Top attempt {}: scroll_height={:.0}, prev={:.0}",
-            top_attempts, info.scroll_height, prev_scroll_height
-        );
-
-        // If scroll_height didn't grow, we've reached the beginning of the channel.
         if (info.scroll_height - prev_scroll_height).abs() < 1.0 {
             info!(
                 "Reached channel beginning (scroll_height stable at {:.0})",
                 info.scroll_height
             );
+            // Collect one more time at the very top
+            let batch = collect_visible_messages(client).await?;
+            for msg in batch {
+                if seen.insert(msg.dedup_hash.clone()) {
+                    ordered.push(msg);
+                }
+            }
             break;
         }
 
@@ -438,28 +472,51 @@ pub async fn scrape_history(
 
         if top_attempts >= max_top_attempts {
             warn!(
-                "Reached max top-scroll attempts ({}), proceeding with collection",
+                "Reached max top-scroll attempts ({}), proceeding",
                 max_top_attempts
             );
+            let batch = collect_visible_messages(client).await?;
+            for msg in batch {
+                if seen.insert(msg.dedup_hash.clone()) {
+                    ordered.push(msg);
+                }
+            }
             break;
         }
     }
 
-    // Phase 2: sweep downward from top to bottom.
-    info!("Phase 2: Sweeping downward to collect messages...");
-    client.eval(SCROLL_TO_TOP_SCRIPT).await?;
-    client.wait_ms(1000).await?;
+    info!(
+        "Collected {} messages while scrolling to top. Jumping to present...",
+        ordered.len()
+    );
 
-    let messages = sweep_to_bottom(client, max_pages).await?;
-    info!("History scrape complete: {} messages", messages.len());
-    Ok(messages)
+    // Click "Jump to Present" to instantly reach the bottom (avoids slow sweep)
+    let jumped: bool = client.eval_json(CLICK_JUMP_TO_PRESENT_SCRIPT).await.unwrap_or(false);
+    if jumped {
+        info!("Clicked 'Jump to Present' — jumped to bottom");
+        client.wait_ms(2000).await?;
+    } else {
+        info!("No 'Jump to Present' button found — scrolling to bottom");
+        client.eval(SCROLL_TO_BOTTOM_SCRIPT).await?;
+        client.wait_ms(1000).await?;
+    }
+
+    // Collect messages at the bottom (the most recent ones)
+    let batch = collect_visible_messages(client).await?;
+    for msg in batch {
+        if seen.insert(msg.dedup_hash.clone()) {
+            ordered.push(msg);
+        }
+    }
+
+    info!("History scrape complete: {} messages", ordered.len());
+    Ok(ordered)
 }
 
 /// Sweep downward from the current scroll position to the bottom, collecting all messages.
-/// Used by both `scrape_history` (Phase 2) and `catch_up_to_bottom`.
+/// No page limit — runs until it naturally reaches the bottom of the scroll area.
 async fn sweep_to_bottom(
     client: &AgentBrowserClient,
-    max_pages: u64,
 ) -> AppResult<Vec<ScrapedMessage>> {
     let mut seen: HashSet<String> = HashSet::new();
     let mut ordered: Vec<ScrapedMessage> = Vec::new();
@@ -478,12 +535,7 @@ async fn sweep_to_bottom(
             "Sweep page {}: {} new messages (total {})",
             page, new_in_batch, ordered.len()
         );
-
         page += 1;
-        if page >= max_pages {
-            info!("Reached max sweep pages ({})", max_pages);
-            break;
-        }
 
         let info: ScrollInfo = client.eval_json(MSG_SCROLL_INFO_SCRIPT).await?;
         let step = info.client_height.max(300.0);
@@ -516,11 +568,10 @@ async fn sweep_to_bottom(
 /// bottom is enough to pick up any messages missed while the service was offline.
 pub async fn catch_up_to_bottom(
     client: &AgentBrowserClient,
-    max_pages: u64,
 ) -> AppResult<Vec<ScrapedMessage>> {
     // Brief wait for Discord to finish rendering after navigation
     client.wait_ms(1000).await?;
-    sweep_to_bottom(client, max_pages).await
+    sweep_to_bottom(client).await
 }
 
 /// Poll for new messages without any scrolling.

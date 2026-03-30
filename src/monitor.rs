@@ -60,7 +60,7 @@ impl Monitor {
                 "DB has {} messages — catching up from current position...",
                 existing_count
             );
-            scraper::catch_up_to_bottom(&client, self.config.scraper.initial_scroll_pages).await?
+            scraper::catch_up_to_bottom(&client).await?
         };
         let inserted = self.store.insert_batch(&history)?;
         info!(
