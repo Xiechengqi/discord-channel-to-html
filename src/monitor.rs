@@ -49,11 +49,8 @@ impl Monitor {
         let existing_count = self.store.count().unwrap_or(0);
         let history = if existing_count == 0 {
             self.set_status("loading_history");
-            info!(
-                "DB is empty — starting full history scrape (max_pages={})...",
-                self.config.scraper.initial_scroll_pages
-            );
-            scraper::scrape_history(&client, self.config.scraper.initial_scroll_pages).await?
+            info!("DB is empty — starting full history scrape...");
+            scraper::scrape_history(&client).await?
         } else {
             self.set_status("catching_up");
             info!(

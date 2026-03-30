@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use serde::Deserialize;
 use serde_json::Value;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::agent_browser::client::AgentBrowserClient;
 use crate::db::ScrapedMessage;
@@ -411,18 +411,18 @@ async fn wait_for_scroll_stable(client: &AgentBrowserClient) -> AppResult<Scroll
 /// so we MUST sweep through every position to collect all messages.
 pub async fn scrape_history(
     client: &AgentBrowserClient,
-    max_pages: u64,
 ) -> AppResult<Vec<ScrapedMessage>> {
-    // Phase 1: Scroll to the absolute top, waiting for all history to load.
+    // Phase 1: Scroll to the absolute top until scroll_height stabilizes.
+    // No attempt limit — keep going until Discord has loaded all history.
     info!("Phase 1: Loading all history by scrolling to top...");
     let mut prev_scroll_height = 0.0f64;
     let mut top_attempts = 0u64;
-    let max_top_attempts = max_pages;
 
     loop {
         client.eval(SCROLL_TO_TOP_SCRIPT).await?;
         let info = wait_for_scroll_stable(client).await?;
 
+        top_attempts += 1;
         debug!(
             "Top attempt {}: scroll_height={:.0}, prev={:.0}",
             top_attempts, info.scroll_height, prev_scroll_height
@@ -430,22 +430,13 @@ pub async fn scrape_history(
 
         if (info.scroll_height - prev_scroll_height).abs() < 1.0 {
             info!(
-                "Reached channel beginning (scroll_height stable at {:.0})",
-                info.scroll_height
+                "Reached channel beginning after {} attempts (scroll_height={:.0})",
+                top_attempts, info.scroll_height
             );
             break;
         }
 
         prev_scroll_height = info.scroll_height;
-        top_attempts += 1;
-
-        if top_attempts >= max_top_attempts {
-            warn!(
-                "Reached max top-scroll attempts ({}), proceeding with collection",
-                max_top_attempts
-            );
-            break;
-        }
     }
 
     // Phase 2: Sweep from top to bottom collecting all messages.
