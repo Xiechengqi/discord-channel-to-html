@@ -84,9 +84,20 @@ const COLLECT_SCRIPT: &str = r#"JSON.stringify((function() {
         // Skip nodes that produced nothing (true UI noise)
         if (!combined && !authorEl) return;
 
+        // Timestamp: prefer the ISO 8601 `datetime` attribute on <time>.
+        // Fall back to deriving from the Discord snowflake ID (first 42 bits = ms since Discord epoch).
+        // Never use textContent — it's a human-readable locale string that sorts incorrectly.
+        var ts = timeEl ? (timeEl.getAttribute('datetime') || '') : '';
+        if (!ts && msgId) {
+            try {
+                var ms = Number(BigInt(msgId) >> BigInt(22)) + 1420070400000;
+                ts = new Date(ms).toISOString();
+            } catch(e) {}
+        }
+
         results.push({
             author: authorEl ? authorEl.textContent.trim() : '',
-            time: timeEl ? (timeEl.getAttribute('datetime') || timeEl.textContent.trim()) : '',
+            time: ts,
             message: combined,
             msgId: msgId,
             domIndex: idx
@@ -481,6 +492,41 @@ pub async fn scrape_history(
 
     info!("History scrape complete: {} messages", ordered.len());
     Ok(ordered)
+}
+
+/// Check whether new messages have appeared since the last scrape.
+///
+/// Scrolls to the bottom (one scroll op, non-disruptive) then reads the last visible
+/// message's Discord ID. Returns `true` if it differs from `latest_discord_id` (meaning
+/// there are new messages), `false` if they match (nothing to do).
+///
+/// Falls back to `true` (trigger a scrape) if the DOM has no identifiable message or
+/// `latest_discord_id` is None (DB empty / SHA-256 hash).
+pub async fn check_has_new_messages(
+    client: &AgentBrowserClient,
+    latest_discord_id: Option<&str>,
+) -> AppResult<bool> {
+    let Some(known_id) = latest_discord_id else {
+        return Ok(true); // DB empty or no snowflake ID — always scrape
+    };
+
+    // Scroll to bottom so Discord renders the newest messages
+    client.eval(SCROLL_TO_BOTTOM_SCRIPT).await?;
+    client.wait_ms(300).await?;
+
+    // Grab the Discord ID of the last rendered message
+    const LAST_ID_SCRIPT: &str = r#"JSON.stringify((function() {
+        var els = document.querySelectorAll('[id^="message-content-"]');
+        if (!els.length) return '';
+        return els[els.length - 1].id.replace('message-content-', '');
+    })())"#;
+
+    let last_id: String = client.eval_json(LAST_ID_SCRIPT).await?;
+    if last_id.is_empty() {
+        return Ok(true); // can't determine — be safe
+    }
+
+    Ok(last_id != known_id)
 }
 
 /// Scrape recent messages by scrolling up a few pages from the bottom.

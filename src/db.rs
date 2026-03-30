@@ -162,7 +162,7 @@ impl MessageStore {
                 (Some(b), Some(a)) => (
                     "SELECT id, author, timestamp, content, scraped_at FROM messages \
                      WHERE timestamp < ?1 AND timestamp > ?2 \
-                     ORDER BY timestamp DESC LIMIT ?3"
+                     ORDER BY id DESC LIMIT ?3"
                         .to_string(),
                     vec![
                         Box::new(b.to_string()),
@@ -173,20 +173,20 @@ impl MessageStore {
                 (Some(b), None) => (
                     "SELECT id, author, timestamp, content, scraped_at FROM messages \
                      WHERE timestamp < ?1 \
-                     ORDER BY timestamp DESC LIMIT ?2"
+                     ORDER BY id DESC LIMIT ?2"
                         .to_string(),
                     vec![Box::new(b.to_string()), Box::new(limit)],
                 ),
                 (None, Some(a)) => (
                     "SELECT id, author, timestamp, content, scraped_at FROM messages \
                      WHERE timestamp > ?1 \
-                     ORDER BY timestamp DESC LIMIT ?2"
+                     ORDER BY id DESC LIMIT ?2"
                         .to_string(),
                     vec![Box::new(a.to_string()), Box::new(limit)],
                 ),
                 (None, None) => (
                     "SELECT id, author, timestamp, content, scraped_at FROM messages \
-                     ORDER BY timestamp DESC LIMIT ?1"
+                     ORDER BY id DESC LIMIT ?1"
                         .to_string(),
                     vec![Box::new(limit)],
                 ),
@@ -225,7 +225,7 @@ impl MessageStore {
         let mut stmt = conn
             .prepare_cached(
                 "SELECT id, author, timestamp, content, scraped_at FROM messages \
-                 ORDER BY timestamp DESC LIMIT ?1",
+                 ORDER BY id DESC LIMIT ?1",
             )
             .map_err(|e| AppError::DatabaseError(e.to_string()))?;
 
@@ -247,6 +247,22 @@ impl MessageStore {
         }
         messages.reverse(); // chronological order
         Ok(messages)
+    }
+
+    /// Return the Discord snowflake ID of the most recently inserted message,
+    /// or None if the DB is empty or the latest entry uses a SHA-256 hash.
+    pub fn get_latest_discord_id(&self) -> AppResult<Option<String>> {
+        let conn = self.conn.lock().map_err(|e| AppError::DatabaseError(e.to_string()))?;
+        let result = conn.query_row(
+            "SELECT dedup_hash FROM messages ORDER BY id DESC LIMIT 1",
+            [],
+            |row| row.get::<_, String>(0),
+        );
+        match result {
+            Ok(hash) => Ok(hash.strip_prefix("discord:").map(str::to_string)),
+            Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(e) => Err(AppError::DatabaseError(e.to_string())),
+        }
     }
 
     pub fn count(&self) -> AppResult<u64> {

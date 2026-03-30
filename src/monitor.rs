@@ -73,6 +73,17 @@ impl Monitor {
         loop {
             sleep(interval).await;
 
+            // Quick check: compare the last visible Discord message ID with DB latest.
+            // Only do the expensive multi-page scroll-back when something is actually new.
+            let latest_id = self.store.get_latest_discord_id().unwrap_or(None);
+            let has_new = scraper::check_has_new_messages(&client, latest_id.as_deref())
+                .await
+                .unwrap_or(true); // on error, fall through to scrape
+
+            if !has_new {
+                continue;
+            }
+
             match scraper::scrape_recent(&client, POLL_PAGES).await {
                 Ok(messages) => {
                     if !messages.is_empty() {
