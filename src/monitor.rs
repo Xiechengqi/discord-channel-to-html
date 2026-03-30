@@ -10,8 +10,6 @@ use crate::db::MessageStore;
 use crate::errors::AppResult;
 use crate::scraper;
 
-/// How many viewports to scroll back when polling for recent messages.
-const POLL_PAGES: u64 = 3;
 
 pub struct Monitor {
     config: AppConfig,
@@ -65,26 +63,16 @@ impl Monitor {
         // ── Phase 2: Polling loop ─────────────────────────────────────────────
         self.set_status("monitoring");
         info!(
-            "Entering monitoring mode (interval={}s, poll_pages={})",
-            self.config.scraper.poll_interval_secs, POLL_PAGES
+            "Entering monitoring mode (interval={}s)",
+            self.config.scraper.poll_interval_secs
         );
         let interval = Duration::from_secs(self.config.scraper.poll_interval_secs);
 
         loop {
             sleep(interval).await;
 
-            // Quick check: compare the last visible Discord message ID with DB latest.
-            // Only do the expensive multi-page scroll-back when something is actually new.
             let latest_id = self.store.get_latest_discord_id().unwrap_or(None);
-            let has_new = scraper::check_has_new_messages(&client, latest_id.as_deref())
-                .await
-                .unwrap_or(true); // on error, fall through to scrape
-
-            if !has_new {
-                continue;
-            }
-
-            match scraper::scrape_recent(&client, POLL_PAGES).await {
+            match scraper::poll_new_messages(&client, latest_id.as_deref()).await {
                 Ok(messages) => {
                     if !messages.is_empty() {
                         match self.store.insert_batch(&messages) {

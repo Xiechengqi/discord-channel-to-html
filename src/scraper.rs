@@ -479,8 +479,16 @@ pub async fn scrape_history(
         let step = info.client_height.max(300.0);
         let new_top = info.scroll_top + step;
 
-        // If we've reached the bottom, done.
+        // If we've reached the bottom, do one final collection and stop.
         if info.scroll_top + info.client_height >= info.scroll_height - 1.0 {
+            client.eval(SCROLL_TO_BOTTOM_SCRIPT).await?;
+            client.wait_ms(500).await?;
+            let batch = collect_visible_messages(client).await?;
+            for msg in batch {
+                if seen.insert(msg.dedup_hash.clone()) {
+                    ordered.push(msg);
+                }
+            }
             break;
         }
 
@@ -494,27 +502,18 @@ pub async fn scrape_history(
     Ok(ordered)
 }
 
-/// Check whether new messages have appeared since the last scrape.
+/// Poll for new messages without any scrolling.
 ///
-/// Scrolls to the bottom (one scroll op, non-disruptive) then reads the last visible
-/// message's Discord ID. Returns `true` if it differs from `latest_discord_id` (meaning
-/// there are new messages), `false` if they match (nothing to do).
+/// Discord auto-displays new messages in the current view, so we just:
+/// 1. Read the last visible message ID from the DOM (no scroll).
+/// 2. If it matches `latest_discord_id` → nothing new, return empty.
+/// 3. If it differs → collect all currently visible messages and return them.
 ///
-/// Falls back to `true` (trigger a scrape) if the DOM has no identifiable message or
-/// `latest_discord_id` is None (DB empty / SHA-256 hash).
-pub async fn check_has_new_messages(
+/// This avoids the disruptive multi-page scroll-back that ran on every poll cycle.
+pub async fn poll_new_messages(
     client: &AgentBrowserClient,
     latest_discord_id: Option<&str>,
-) -> AppResult<bool> {
-    let Some(known_id) = latest_discord_id else {
-        return Ok(true); // DB empty or no snowflake ID — always scrape
-    };
-
-    // Scroll to bottom so Discord renders the newest messages
-    client.eval(SCROLL_TO_BOTTOM_SCRIPT).await?;
-    client.wait_ms(300).await?;
-
-    // Grab the Discord ID of the last rendered message
+) -> AppResult<Vec<ScrapedMessage>> {
     const LAST_ID_SCRIPT: &str = r#"JSON.stringify((function() {
         var els = document.querySelectorAll('[id^="message-content-"]');
         if (!els.length) return '';
@@ -522,65 +521,14 @@ pub async fn check_has_new_messages(
     })())"#;
 
     let last_id: String = client.eval_json(LAST_ID_SCRIPT).await?;
-    if last_id.is_empty() {
-        return Ok(true); // can't determine — be safe
-    }
 
-    Ok(last_id != known_id)
-}
-
-/// Scrape recent messages by scrolling up a few pages from the bottom.
-/// This catches messages that arrived between polls even if they exceed one viewport.
-pub async fn scrape_recent(
-    client: &AgentBrowserClient,
-    pages: u64,
-) -> AppResult<Vec<ScrapedMessage>> {
-    // Start at the bottom
-    client.eval(SCROLL_TO_BOTTOM_SCRIPT).await?;
-    client.wait_ms(300).await?;
-
-    let info: ScrollInfo = client.eval_json(MSG_SCROLL_INFO_SCRIPT).await?;
-    let step = info.client_height.max(300.0);
-
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut all: Vec<ScrapedMessage> = Vec::new();
-
-    // Scroll up `pages` times to cover more than one viewport
-    let scroll_up_to = (info.scroll_top - step * pages as f64).max(0.0);
-    client
-        .eval(&scroll_to_script(scroll_up_to as u64))
-        .await?;
-    client.wait_ms(500).await?;
-
-    // Now sweep back down to bottom, collecting everything
-    let mut pos = scroll_up_to;
-    loop {
-        let batch = collect_visible_messages(client).await?;
-        for msg in batch {
-            if seen.insert(msg.dedup_hash.clone()) {
-                all.push(msg);
-            }
-        }
-
-        let current: ScrollInfo = client.eval_json(MSG_SCROLL_INFO_SCRIPT).await?;
-        if current.scroll_top + current.client_height >= current.scroll_height - 1.0 {
-            break;
-        }
-
-        pos += step;
-        client.eval(&scroll_to_script(pos as u64)).await?;
-        client.wait_ms(300).await?;
-    }
-
-    // Final collection at the very bottom
-    client.eval(SCROLL_TO_BOTTOM_SCRIPT).await?;
-    client.wait_ms(300).await?;
-    let batch = collect_visible_messages(client).await?;
-    for msg in batch {
-        if seen.insert(msg.dedup_hash.clone()) {
-            all.push(msg);
+    // If we have a known ID and it matches the last DOM message → nothing new
+    if let Some(known) = latest_discord_id {
+        if !last_id.is_empty() && last_id == known {
+            return Ok(vec![]);
         }
     }
 
-    Ok(all)
+    // New messages are visible — collect without scrolling
+    collect_visible_messages(client).await
 }
