@@ -10,8 +10,25 @@ const CONFIG_FILE_NAME: &str = "config.toml";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiscordConfig {
-    pub server: String,
-    pub channel: String,
+    /// Full Discord channel URL, e.g. https://discord.com/channels/799672011265015819/1162768567821930597
+    pub channel_url: String,
+}
+
+impl DiscordConfig {
+    /// Extract (guild_id, channel_id) from channel_url.
+    /// Returns empty strings if the URL doesn't match the expected format.
+    pub fn parse_ids(&self) -> (String, String) {
+        // Expected path: /channels/{guild_id}/{channel_id}
+        let path = self.channel_url
+            .trim_start_matches("https://discord.com")
+            .trim_start_matches("http://discord.com");
+        let parts: Vec<&str> = path.trim_start_matches('/').split('/').collect();
+        if parts.len() >= 3 && parts[0] == "channels" {
+            (parts[1].to_string(), parts[2].to_string())
+        } else {
+            (String::new(), String::new())
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -78,8 +95,7 @@ impl Default for AppConfig {
 
         Self {
             discord: DiscordConfig {
-                server: String::new(),
-                channel: String::new(),
+                channel_url: String::new(),
             },
             server: ServerConfig {
                 host: "0.0.0.0".to_string(),

@@ -67,6 +67,19 @@ impl AgentBrowserClient {
         parse_response(&output.stdout)
     }
 
+    pub async fn open(&self, url: &str) -> AppResult<()> {
+        let response = self.run(&["open", url]).await?;
+        if response.success {
+            Ok(())
+        } else {
+            Err(AppError::BrowserExecutionFailed(
+                response
+                    .error
+                    .unwrap_or_else(|| "agent-browser open failed".to_string()),
+            ))
+        }
+    }
+
     pub async fn eval(&self, script: &str) -> AppResult<AgentBrowserEvalResult> {
         let response = self.run(&["eval", script]).await?;
         if !response.success {

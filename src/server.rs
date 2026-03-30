@@ -64,7 +64,7 @@ async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
         "ok": true,
         "message_count": count,
         "uptime_secs": uptime,
-        "channel": format!("{}/{}", state.config.discord.server, state.config.discord.channel),
+        "channel": state.config.discord.channel_url,
         "monitor_status": status,
     }))
 }

@@ -37,15 +37,13 @@ impl Monitor {
             timeout_secs: self.config.agent_browser.timeout_secs,
         });
 
-        self.set_status("checking_location");
-        info!(
-            "Checking browser location: expected server={}, channel={}",
-            self.config.discord.server, self.config.discord.channel
-        );
-        scraper::check_current_location(
+        self.set_status("opening_channel");
+        let (guild_id, channel_id) = self.config.discord.parse_ids();
+        scraper::open_channel(
             &client,
-            &self.config.discord.server,
-            &self.config.discord.channel,
+            &self.config.discord.channel_url,
+            &guild_id,
+            &channel_id,
         )
         .await?;
 

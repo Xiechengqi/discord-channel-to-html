@@ -151,72 +151,35 @@ fn scroll_to_script(pos: u64) -> String {
     )
 }
 
-/// Verify that the browser is currently viewing the expected Discord server and channel.
+/// Open the Discord channel URL in the browser and verify the page loaded correctly.
 ///
-/// Reads the active guild nav item and the selected channel item from the DOM.
-/// Returns `Ok(())` if both match (case-insensitive substring match, same logic as navigation).
-/// Returns `Err(AppError::WrongLocation(...))` otherwise, with a clear diagnostic message.
-pub async fn check_current_location(
+/// Uses `agent-browser open <url>` to navigate directly, then checks `window.location.href`
+/// to confirm the browser landed on the expected guild/channel IDs.
+/// Returns `Err(AppError::WrongLocation(...))` if the URL didn't load as expected.
+pub async fn open_channel(
     client: &AgentBrowserClient,
-    expected_server: &str,
-    expected_channel: &str,
+    channel_url: &str,
+    guild_id: &str,
+    channel_id: &str,
 ) -> AppResult<()> {
-    const CHECK_SCRIPT: &str = r#"JSON.stringify((function() {
-        var serverName = '';
-        var guildItems = document.querySelectorAll('[data-list-item-id*="guildsnav___"]');
-        for (var i = 0; i < guildItems.length; i++) {
-            var el = guildItems[i];
-            var listId = el.getAttribute('data-list-item-id') || '';
-            if (!/guildsnav___\d{10,}/.test(listId)) continue;
-            var cls = el.getAttribute('class') || '';
-            var selected = cls.indexOf('selected') !== -1 || el.getAttribute('aria-selected') === 'true';
-            if (!selected) continue;
-            var name = (el.textContent || '').trim();
-            name = name.replace(/^[\d][\d,.]*\s*[^\uff0c,]*[\uff0c,]\s*/, '').trim();
-            serverName = name;
-            break;
-        }
+    info!("Opening channel URL: {}", channel_url);
+    client.open(channel_url).await?;
+    // Wait for Discord to finish navigating
+    client.wait_ms(2000).await?;
 
-        var channelName = '';
-        var channelItems = document.querySelectorAll('[data-list-item-id^="channels___"]');
-        for (var i = 0; i < channelItems.length; i++) {
-            var el = channelItems[i];
-            var cls = el.getAttribute('class') || '';
-            var selected = cls.indexOf('selected') !== -1 || el.getAttribute('aria-selected') === 'true';
-            if (!selected) continue;
-            var label = (el.getAttribute('aria-label') || el.textContent || '').trim();
-            var commaIdx = label.search(/[,\uff0c]/);
-            channelName = commaIdx !== -1 ? label.substring(0, commaIdx).trim() : label;
-            break;
-        }
+    let href: String = client
+        .eval_json("JSON.stringify(window.location.href)")
+        .await?;
 
-        return { serverName: serverName, channelName: channelName };
-    })())"#;
-
-    #[derive(Deserialize)]
-    struct LocationResult {
-        #[serde(rename = "serverName")]
-        server_name: String,
-        #[serde(rename = "channelName")]
-        channel_name: String,
-    }
-
-    let loc: LocationResult = client.eval_json(CHECK_SCRIPT).await?;
-
-    let server_ok = loc.server_name.to_lowercase().contains(&expected_server.to_lowercase());
-    let channel_ok = loc.channel_name.to_lowercase().contains(&expected_channel.to_lowercase());
-
-    if server_ok && channel_ok {
-        info!(
-            "Location check passed: server='{}', channel='{}'",
-            loc.server_name, loc.channel_name
-        );
+    let ok = href.contains(guild_id) && href.contains(channel_id);
+    if ok {
+        info!("Channel opened successfully: {}", href);
         Ok(())
     } else {
         let msg = format!(
-            "Browser is on server='{}' channel='{}', but config expects server='{}' channel='{}'. \
-             Please open Discord in your browser and navigate to the correct channel, then restart.",
-            loc.server_name, loc.channel_name, expected_server, expected_channel
+            "Browser navigated to '{}' but expected guild={} channel={}. \
+             Check that the channel_url in config is correct.",
+            href, guild_id, channel_id
         );
         Err(AppError::WrongLocation(msg))
     }

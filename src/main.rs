@@ -46,9 +46,10 @@ async fn main() {
         config.server.port = port;
     }
 
-    if config.discord.server.is_empty() || config.discord.channel.is_empty() {
+    if config.discord.channel_url.is_empty() {
         eprintln!(
-            "Error: discord.server and discord.channel must be set in config.\n\
+            "Error: discord.channel_url must be set in config.\n\
+             Example: channel_url = \"https://discord.com/channels/799672011265015819/1162768567821930597\"\n\
              Config file: {}",
             config::config_path().unwrap_or_default().display()
         );
@@ -69,8 +70,8 @@ async fn main() {
     let monitor_status: Arc<RwLock<String>> = Arc::new(RwLock::new("starting".to_string()));
 
     info!(
-        "Starting discord-channel-to-html: server={}, channel={}",
-        config.discord.server, config.discord.channel
+        "Starting discord-channel-to-html: channel_url={}",
+        config.discord.channel_url
     );
 
     // Monitor runs in a restart loop: when resync_notify fires, the current
