@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use tokio::sync::Notify;
+use tokio::sync::{Notify, RwLock};
 use tokio::time::{Duration, sleep};
 use tracing::{error, info};
 
@@ -53,7 +53,7 @@ async fn monitor_channel(
 }
 /// Multi-channel monitor loop
 pub async fn run_monitor_loop(
-    config: AppConfig,
+    config: Arc<RwLock<AppConfig>>,
     server_store: Arc<ServerStore>,
     notify: Arc<Notify>,
 ) {
@@ -77,17 +77,21 @@ pub async fn run_monitor_loop(
 
         info!("Monitoring {} channels", channels.len());
 
+        // Snapshot config for this cycle
+        let cfg = config.read().await.clone();
+
         for ch in &channels {
             info!("Processing channel: {} ({})", ch.name, ch.channel_id);
 
-            if let Err(e) = monitor_channel(&config, &server_store, ch).await {
+            if let Err(e) = monitor_channel(&cfg, &server_store, ch).await {
                 error!("Channel {} error: {e}", ch.channel_id);
             }
         }
 
-        // Poll interval
+        // Poll interval — re-read in case it was updated
+        let poll_secs = config.read().await.scraper.poll_interval_secs;
         tokio::select! {
-            _ = sleep(Duration::from_secs(config.scraper.poll_interval_secs)) => {},
+            _ = sleep(Duration::from_secs(poll_secs)) => {},
             _ = notify.notified() => {
                 info!("Channel list changed, reloading...");
             }

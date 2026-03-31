@@ -9,7 +9,7 @@ use axum::routing::{delete, get, post};
 use axum::Router;
 use serde::Deserialize;
 use serde_json::json;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, RwLock};
 
 use crate::auth::check_auth;
 use crate::config::AppConfig;
@@ -18,7 +18,7 @@ use crate::server_store::ServerStore;
 
 pub struct AppState {
     pub server_store: Arc<ServerStore>,
-    pub config: AppConfig,
+    pub config: Arc<RwLock<AppConfig>>,
     pub start_time: Instant,
     pub monitor_notify: Arc<Notify>,
 }
@@ -28,16 +28,17 @@ pub async fn serve(
     server_store: Arc<ServerStore>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let monitor_notify = Arc::new(Notify::new());
+    let shared_config = Arc::new(RwLock::new(config.clone()));
 
     let state = Arc::new(AppState {
         server_store: server_store.clone(),
-        config: config.clone(),
+        config: shared_config.clone(),
         start_time: Instant::now(),
         monitor_notify: monitor_notify.clone(),
     });
 
     // Spawn the monitor manager
-    let monitor_config = config.clone();
+    let monitor_config = shared_config.clone();
     let monitor_store = server_store.clone();
     let monitor_notify_ref = monitor_notify.clone();
     tokio::spawn(async move {
@@ -72,10 +73,11 @@ async fn health(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let total_messages: u64 = monitored.iter()
         .map(|c| state.server_store.channel_message_count(&c.channel_id))
         .sum();
+    let config = state.config.read().await;
 
     Json(json!({
         "ok": true,
-        "server_url": state.config.discord.server_url,
+        "server_url": config.discord.server_url,
         "uptime_secs": uptime,
         "total_channels": channels.len(),
         "monitored_channels": monitored.len(),
@@ -111,7 +113,8 @@ async fn refresh_channels(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, AppError> {
-    if !check_auth(&headers, &state.config.auth) {
+    let config = state.config.read().await;
+    if !check_auth(&headers, &config.auth) {
         return Err(AppError::AuthRequired);
     }
 
@@ -119,19 +122,19 @@ async fn refresh_channels(
     use crate::agent_browser::types::AgentBrowserOptions;
 
     let client = AgentBrowserClient::new(AgentBrowserOptions {
-        binary: state.config.agent_browser.binary.clone(),
-        session_name: state.config.agent_browser.session_name.clone(),
-        timeout_secs: state.config.agent_browser.timeout_secs,
+        binary: config.agent_browser.binary.clone(),
+        session_name: config.agent_browser.session_name.clone(),
+        timeout_secs: config.agent_browser.timeout_secs,
     });
 
-    let guild_id = state.config.discord.guild_id();
-    client.open(&state.config.discord.server_url).await?;
+    let guild_id = config.discord.guild_id();
+    client.open(&config.discord.server_url).await?;
     client.wait_ms(2000).await?;
 
     let channels = crate::scraper::list_channels(
         &client,
         &guild_id,
-        &state.config.discord.server_url,
+        &config.discord.server_url,
     ).await?;
 
     state.server_store.upsert_channels(&channels)?;
@@ -149,7 +152,7 @@ async fn add_monitor(
     headers: HeaderMap,
     Path(channel_id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
-    if !check_auth(&headers, &state.config.auth) {
+    if !check_auth(&headers, &state.config.read().await.auth) {
         return Err(AppError::AuthRequired);
     }
     state.server_store.add_monitored(&channel_id)?;
@@ -163,7 +166,7 @@ async fn remove_monitor(
     headers: HeaderMap,
     Path(channel_id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
-    if !check_auth(&headers, &state.config.auth) {
+    if !check_auth(&headers, &state.config.read().await.auth) {
         return Err(AppError::AuthRequired);
     }
     state.server_store.remove_monitored(&channel_id)?;
@@ -177,7 +180,7 @@ async fn resync_channel(
     headers: HeaderMap,
     Path(channel_id): Path<String>,
 ) -> Result<impl IntoResponse, AppError> {
-    if !check_auth(&headers, &state.config.auth) {
+    if !check_auth(&headers, &state.config.read().await.auth) {
         return Err(AppError::AuthRequired);
     }
     state.server_store.clear_channel_data(&channel_id)?;
@@ -199,7 +202,7 @@ async fn get_messages(
     headers: HeaderMap,
     Query(query): Query<MessagesQuery>,
 ) -> Result<impl IntoResponse, AppError> {
-    if !check_auth(&headers, &state.config.auth) {
+    if !check_auth(&headers, &state.config.read().await.auth) {
         return Err(AppError::AuthRequired);
     }
 
@@ -243,7 +246,7 @@ async fn get_latest(
     headers: HeaderMap,
     Query(query): Query<LatestQuery>,
 ) -> Result<impl IntoResponse, AppError> {
-    if !check_auth(&headers, &state.config.auth) {
+    if !check_auth(&headers, &state.config.read().await.auth) {
         return Err(AppError::AuthRequired);
     }
 
@@ -266,10 +269,11 @@ async fn get_latest(
 }
 
 async fn get_config(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let config = state.config.read().await;
     Json(json!({
         "ok": true,
-        "poll_interval_secs": state.config.scraper.poll_interval_secs,
-        "max_history_pages": state.config.scraper.max_history_pages,
+        "poll_interval_secs": config.scraper.poll_interval_secs,
+        "max_history_pages": config.scraper.max_history_pages,
     }))
 }
 
@@ -284,20 +288,27 @@ async fn update_config(
     headers: HeaderMap,
     Json(update): Json<ConfigUpdate>,
 ) -> Result<impl IntoResponse, AppError> {
-    if !check_auth(&headers, &state.config.auth) {
+    // Build updated config from a snapshot (don't hold write lock during I/O)
+    let mut new_config = state.config.read().await.clone();
+    if !check_auth(&headers, &new_config.auth) {
         return Err(AppError::AuthRequired);
     }
 
-    let mut config = state.config.clone();
     if let Some(interval) = update.poll_interval_secs {
-        config.scraper.poll_interval_secs = interval;
+        new_config.scraper.poll_interval_secs = interval;
     }
     if let Some(pages) = update.max_history_pages {
-        config.scraper.max_history_pages = pages;
+        new_config.scraper.max_history_pages = pages;
     }
 
+    // Save to disk first — only update memory if persist succeeds
     let path = crate::config::config_path()?;
-    crate::config::save(&path, &config).await?;
+    crate::config::save(&path, &new_config).await?;
+
+    *state.config.write().await = new_config;
+
+    // Wake monitor loop so new poll_interval takes effect immediately
+    state.monitor_notify.notify_one();
 
     Ok((StatusCode::OK, Json(json!({ "ok": true }))))
 }
