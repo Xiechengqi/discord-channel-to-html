@@ -272,15 +272,4 @@ impl MessageStore {
             .map_err(|e| AppError::DatabaseError(e.to_string()))?;
         Ok(count)
     }
-
-    /// Delete all messages and reset the auto-increment counter.
-    pub fn clear(&self) -> AppResult<()> {
-        let conn = self.conn.lock().map_err(|e| AppError::DatabaseError(e.to_string()))?;
-        conn.execute_batch(
-            "DELETE FROM messages;
-             DELETE FROM sqlite_sequence WHERE name = 'messages';",
-        )
-        .map_err(|e| AppError::DatabaseError(e.to_string()))?;
-        Ok(())
-    }
 }

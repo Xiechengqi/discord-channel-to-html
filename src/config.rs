@@ -27,11 +27,6 @@ impl DiscordConfig {
             String::new()
         }
     }
-
-    /// Build a channel URL from guild_id + channel_id.
-    pub fn channel_url(&self, channel_id: &str) -> String {
-        format!("{}/{}", self.server_url.trim_end_matches('/'), channel_id)
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -51,6 +51,7 @@ pub enum AppError {
     ConfigWriteFailed(String),
     #[error("database error: {0}")]
     DatabaseError(String),
+    #[allow(dead_code)]
     #[error("{0}")]
     Internal(String),
     /// Browser is not on the expected Discord server/channel — requires human intervention.
@@ -84,10 +85,6 @@ impl AppError {
             | Self::Internal(_)
             | Self::WrongLocation(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
-    }
-
-    pub fn is_wrong_location(&self) -> bool {
-        matches!(self, Self::WrongLocation(_))
     }
 }
 

@@ -5,3 +5,4 @@ frontend/out
 *.db
 *.db-wal
 *.db-shm
+/discord-channel-to-html

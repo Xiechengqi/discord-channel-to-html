@@ -224,9 +224,13 @@ const CHANNEL_SCROLL_INFO_SCRIPT: &str = r#"JSON.stringify((function() {
 /// the channel sidebar and collecting channel items.
 pub async fn list_channels(
     client: &AgentBrowserClient,
-    guild_id: &str,
+    _guild_id: &str,
     server_url: &str,
 ) -> AppResult<Vec<ChannelInfo>> {
+    // First, navigate to the server URL
+    client.open(server_url).await?;
+    client.wait_ms(2000).await?;
+
     #[derive(Deserialize)]
     struct RawChannel {
         #[serde(rename = "channelId")]
@@ -557,7 +561,7 @@ pub async fn scrape_history(
 
         top_attempts += 1;
         debug!(
-            "Top attempt : scroll_height={:.0}, prev={:.0}",
+            "Top attempt {}: scroll_height={:.0}, prev={:.0}",
             top_attempts, info.scroll_height, prev_scroll_height
         );
 

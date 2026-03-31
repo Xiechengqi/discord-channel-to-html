@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use rusqlite::{Connection, params};
@@ -105,21 +105,6 @@ impl ServerStore {
     pub fn get_monitored_channels(&self) -> AppResult<Vec<ChannelInfo>> {
         let all = self.get_all_channels()?;
         Ok(all.into_iter().filter(|c| c.monitored).collect())
-    }
-
-    /// Set monitored=1 for the given channel IDs, monitored=0 for all others.
-    pub fn set_monitored(&self, channel_ids: &[String]) -> AppResult<()> {
-        let conn = self.conn.lock().map_err(|e| AppError::DatabaseError(e.to_string()))?;
-        conn.execute("UPDATE channels SET monitored = 0, updated_at = datetime('now')", [])
-            .map_err(|e| AppError::DatabaseError(e.to_string()))?;
-        let mut stmt = conn.prepare_cached(
-            "UPDATE channels SET monitored = 1, updated_at = datetime('now') WHERE channel_id = ?1"
-        ).map_err(|e| AppError::DatabaseError(e.to_string()))?;
-        for id in channel_ids {
-            stmt.execute(params![id])
-                .map_err(|e| AppError::DatabaseError(e.to_string()))?;
-        }
-        Ok(())
     }
 
     /// Add a single channel to monitoring.

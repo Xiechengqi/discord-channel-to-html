@@ -20,6 +20,7 @@ interface Config {
 export default function ChannelsPage() {
   const [channels, setChannels] = useState<Channel[]>([]);
   const [config, setConfig] = useState<Config | null>(null);
+  const [editConfig, setEditConfig] = useState<Config | null>(null);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
 
@@ -39,7 +40,10 @@ export default function ChannelsPage() {
     try {
       const res = await fetch('/api/config');
       const data = await res.json();
-      if (data.ok) setConfig(data);
+      if (data.ok) {
+        setConfig(data);
+        setEditConfig(data);
+      }
     } catch (e) {
       console.error('Failed to fetch config:', e);
     }
@@ -56,6 +60,14 @@ export default function ChannelsPage() {
     } catch (e) {
       console.error('Failed to update config:', e);
     }
+  };
+
+  const handleSaveConfig = async () => {
+    if (!editConfig) return;
+    await updateConfig({
+      poll_interval_secs: editConfig.poll_interval_secs,
+      max_history_pages: editConfig.max_history_pages,
+    });
   };
 
   const handleRefresh = async () => {
@@ -125,7 +137,7 @@ export default function ChannelsPage() {
           </div>
         </div>
 
-        {config && (
+        {editConfig && (
           <div className="mb-6 p-4 bg-discord-bg-secondary rounded">
             <h2 className="text-lg font-semibold mb-3">Settings</h2>
             <div className="grid grid-cols-2 gap-4">
@@ -135,8 +147,8 @@ export default function ChannelsPage() {
                 </label>
                 <input
                   type="number"
-                  value={config.poll_interval_secs}
-                  onChange={(e) => updateConfig({ poll_interval_secs: parseInt(e.target.value) })}
+                  value={editConfig.poll_interval_secs}
+                  onChange={(e) => setEditConfig({ ...editConfig, poll_interval_secs: parseInt(e.target.value) || 1 })}
                   className="w-full bg-discord-bg-tertiary px-3 py-2 rounded border-none outline-none"
                   min="1"
                 />
@@ -147,16 +159,20 @@ export default function ChannelsPage() {
                 </label>
                 <input
                   type="number"
-                  value={config.max_history_pages ?? ''}
-                  onChange={(e) => updateConfig({
-                    max_history_pages: e.target.value ? parseInt(e.target.value) : null
-                  })}
+                  value={editConfig.max_history_pages ?? ''}
+                  onChange={(e) => setEditConfig({ ...editConfig, max_history_pages: e.target.value ? parseInt(e.target.value) : null })}
                   className="w-full bg-discord-bg-tertiary px-3 py-2 rounded border-none outline-none"
                   placeholder="Unlimited"
                   min="1"
                 />
               </div>
             </div>
+            <button
+              onClick={handleSaveConfig}
+              className="mt-4 px-4 py-2 bg-discord-blurple hover:bg-discord-blurple-dark rounded transition-colors"
+            >
+              Save
+            </button>
           </div>
         )}
 
