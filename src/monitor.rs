@@ -1,4 +1,5 @@
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 
 use tokio::sync::{Notify, RwLock};
 use tokio::time::{Duration, sleep};
@@ -51,15 +52,72 @@ async fn monitor_channel(
 
     Ok(())
 }
+/// Process pending resyncs. Returns the set of channel IDs that were successfully resynced.
+async fn process_pending_resyncs(
+    pending_resyncs: &Mutex<HashSet<String>>,
+    config: &AppConfig,
+    server_store: &ServerStore,
+) -> HashSet<String> {
+    let resyncs: Vec<String> = match pending_resyncs.lock() {
+        Ok(p) => p.iter().cloned().collect(),
+        Err(_) => return HashSet::new(),
+    };
+
+    if resyncs.is_empty() {
+        return HashSet::new();
+    }
+
+    let all_channels = match server_store.get_all_channels() {
+        Ok(chs) => chs,
+        Err(e) => {
+            error!("Failed to get channels for resync: {e}");
+            return HashSet::new();
+        }
+    };
+
+    let mut completed = HashSet::new();
+
+    for ch_id in &resyncs {
+        if let Some(ch) = all_channels.iter().find(|c| c.channel_id == *ch_id) {
+            info!("Resync: re-scraping channel {} ({})", ch.name, ch.channel_id);
+            match monitor_channel(config, server_store, ch).await {
+                Ok(_) => {
+                    completed.insert(ch_id.clone());
+                }
+                Err(e) => {
+                    error!("Resync {} error (will retry next cycle): {e}", ch.channel_id);
+                }
+            }
+        } else {
+            // Channel not found, remove from queue
+            completed.insert(ch_id.clone());
+        }
+    }
+
+    // Only remove successfully completed resyncs from the queue
+    if let Ok(mut pending) = pending_resyncs.lock() {
+        for id in &completed {
+            pending.remove(id);
+        }
+    }
+
+    completed
+}
+
 /// Multi-channel monitor loop
 pub async fn run_monitor_loop(
     config: Arc<RwLock<AppConfig>>,
     server_store: Arc<ServerStore>,
     notify: Arc<Notify>,
+    pending_resyncs: Arc<Mutex<HashSet<String>>>,
 ) {
     info!("MonitorManager started");
 
     loop {
+        // Handle any pending resyncs first
+        let cfg = config.read().await.clone();
+        let resynced = process_pending_resyncs(&pending_resyncs, &cfg, &server_store).await;
+
         let channels = match server_store.get_monitored_channels() {
             Ok(chs) => chs,
             Err(e) => {
@@ -77,10 +135,18 @@ pub async fn run_monitor_loop(
 
         info!("Monitoring {} channels", channels.len());
 
-        // Snapshot config for this cycle
-        let cfg = config.read().await.clone();
-
         for ch in &channels {
+            // Check for pending resyncs between each channel — prioritize them
+            if pending_resyncs.lock().map_or(false, |p| !p.is_empty()) {
+                info!("Pending resync detected, interrupting normal cycle");
+                break;
+            }
+
+            // Skip channels already handled by resync this cycle
+            if resynced.contains(&ch.channel_id) {
+                continue;
+            }
+
             info!("Processing channel: {} ({})", ch.name, ch.channel_id);
 
             if let Err(e) = monitor_channel(&cfg, &server_store, ch).await {

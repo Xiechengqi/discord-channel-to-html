@@ -1,4 +1,5 @@
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use axum::Json;
@@ -21,6 +22,7 @@ pub struct AppState {
     pub config: Arc<RwLock<AppConfig>>,
     pub start_time: Instant,
     pub monitor_notify: Arc<Notify>,
+    pub pending_resyncs: Arc<Mutex<HashSet<String>>>,
 }
 
 pub async fn serve(
@@ -29,20 +31,28 @@ pub async fn serve(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let monitor_notify = Arc::new(Notify::new());
     let shared_config = Arc::new(RwLock::new(config.clone()));
+    let pending_resyncs: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
 
     let state = Arc::new(AppState {
         server_store: server_store.clone(),
         config: shared_config.clone(),
         start_time: Instant::now(),
         monitor_notify: monitor_notify.clone(),
+        pending_resyncs: pending_resyncs.clone(),
     });
 
     // Spawn the monitor manager
     let monitor_config = shared_config.clone();
     let monitor_store = server_store.clone();
     let monitor_notify_ref = monitor_notify.clone();
+    let monitor_resyncs = pending_resyncs.clone();
     tokio::spawn(async move {
-        crate::monitor::run_monitor_loop(monitor_config, monitor_store, monitor_notify_ref).await;
+        crate::monitor::run_monitor_loop(
+            monitor_config,
+            monitor_store,
+            monitor_notify_ref,
+            monitor_resyncs,
+        ).await;
     });
 
     let app = Router::new()
@@ -184,6 +194,9 @@ async fn resync_channel(
         return Err(AppError::AuthRequired);
     }
     state.server_store.clear_channel_data(&channel_id)?;
+    if let Ok(mut pending) = state.pending_resyncs.lock() {
+        pending.insert(channel_id.clone());
+    }
     state.monitor_notify.notify_one();
     Ok((StatusCode::OK, Json(json!({ "ok": true }))))
 }
